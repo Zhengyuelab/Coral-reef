@@ -1,0 +1,191 @@
+# =================================================================================
+# 06. Differential Abundance & Community Composition (Volcano)
+# =================================================================================
+# 使用 DESeq2 进行差异丰度分析，并绘制火山图与条形图
+# =================================================================================
+
+# ---------- 1. 加载包 ----------
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(forcats)
+
+# 设置工作目录（请根据需要取消注释并修改）
+setwd("/code/Volcano/Data")
+
+# ---------- 2. 读入数据 ----------
+asv_table      <- read.csv("asv_sampling.csv",   row.names = 1, check.names = FALSE)
+meta_data      <- read.csv("sample_sampling.csv", row.names = 1)
+taxonomy_table <- read.csv("tax_table.csv",      row.names = 1)
+
+# 准备矩阵，并对齐样本
+asv_table_matrix <- as.matrix(asv_table)
+meta_data <- meta_data[match(colnames(asv_table_matrix), rownames(meta_data)), , drop = FALSE]
+
+# ---------- 3. DESeq2 分析 ----------
+dds <- DESeqDataSetFromMatrix(countData = asv_table_matrix,
+                              colData   = meta_data,
+                              design    = ~ Group)   # 分组列名为 Group
+
+# 预过滤：保留至少在一个样本中计数不为零的 ASV
+keep <- rowSums(counts(dds)) > 0
+dds  <- dds[keep, ]
+
+# 估算 size factors（使用 poscounts 方法处理零值）
+dds <- estimateSizeFactors(dds, type = "poscounts")
+dds <- DESeq(dds)
+
+cat("可用比较：", resultsNames(dds), "\n")
+
+# 加载自定义差异分析函数（该函数需输出结果表并保存 CSV）
+source("volcano_results.R")
+
+# ---------- 4. 执行三组比较 ----------
+res_good_vs_moderate <- run_and_save_deseq_results(
+  group1 = "Good", group2 = "Moderate",
+  dds_obj = dds, tax_table = taxonomy_table,
+  log2fc_thresh = 1.5, padj_thresh = 0.05
+)
+
+res_good_vs_poor <- run_and_save_deseq_results(
+  group1 = "Good", group2 = "Poor",
+  dds_obj = dds, tax_table = taxonomy_table
+)
+
+res_moderate_vs_poor <- run_and_save_deseq_results(
+  group1 = "Moderate", group2 = "Poor",
+  dds_obj = dds, tax_table = taxonomy_table
+)
+
+# ---------- 5. 绘图设置 ----------
+log2fc_thresh   <- 1.5
+padj_thresh     <- 0.05
+label_by        <- "ASV_ID"        # 标签列名
+top_n_barchart  <- 10
+output_format   <- "screen"        # "screen", "png", "pdf"
+
+# 健康状态颜色定义
+health_colors <- c("Good" = "#72B063", "Moderate" = "#EFCE87", "Poor" = "#ED8D5A")
+
+# 生成颜色映射的函数（根据比较组自动分配）
+make_color_map <- function(up_group, down_group) {
+  up_color   <- health_colors[up_group]
+  down_color <- health_colors[down_group]
+  setNames(
+    c(up_color, down_color, "grey"),
+    c(paste0("Up-regulated in ", up_group),
+      paste0("Up-regulated in ", down_group),
+      "Not significant")
+  )
+}
+
+# 通用的火山图与条形图绘制函数
+plot_comparison <- function(csv_path, up_group, down_group, color_map,
+                            label_by, log2fc_thresh, padj_thresh, top_n) {
+  # 读取结果
+  res_df_full <- read.csv(csv_path)
+  
+  # 提取比较名称用于标题和文件命名
+  file_basename <- basename(csv_path)
+  groups_title  <- sub("results_(.*)_vs_(.*)\\.csv", "\\1 vs. \\2", file_basename)
+  
+  # 火山图数据预处理
+  res_df_plot <- res_df_full %>% filter(!is.na(padj))
+  if (any(res_df_plot$padj == 0, na.rm = TRUE)) {
+    min_padj <- min(res_df_plot$padj[res_df_plot$padj > 0], na.rm = TRUE)
+    if (is.finite(min_padj)) {
+      res_df_plot$padj[res_df_plot$padj == 0] <- min_padj * 0.01
+    }
+  }
+  if (!label_by %in% colnames(res_df_plot)) {
+    warning(paste("标签列 '", label_by, "' 不存在，使用 ASV_ID"))
+    label_by <- "ASV_ID"
+  }
+  
+  # 火山图
+  p_volcano <- ggplot(res_df_plot, aes(x = log2FoldChange, y = -log10(padj))) +
+    geom_point(aes(color = change), alpha = 1, size = 5) +
+    scale_color_manual(values = color_map, name = "Regulation") +
+    geom_vline(xintercept = c(-log2fc_thresh, log2fc_thresh),
+               linetype = "dashed", color = "grey50") +
+    geom_hline(yintercept = -log10(padj_thresh),
+               linetype = "dashed", color = "grey50") +
+    labs(x = "log2(Fold Change)", y = "-log10(Adjusted P-value)",
+         title = groups_title) +
+    theme_bw() +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          legend.position = "bottom")
+  
+  # 条形图数据（top N 显著 ASV）
+  top_taxa <- res_df_full %>%
+    filter(change != "Not significant") %>%
+    group_by(change) %>%
+    slice_min(order_by = padj, n = top_n, with_ties = FALSE) %>%
+    ungroup()
+  
+  if (nrow(top_taxa) == 0) {
+    p_barchart <- ggplot() +
+      theme_void() +
+      geom_text(aes(x = 0, y = 0, label = "No significantly differential taxa found"),
+                size = 5) +
+      labs(title = paste("Top", top_n, "Differentially Abundant Taxa"))
+  } else {
+    plot_data_barchart <- top_taxa %>%
+      mutate(Label = .data[[label_by]],
+             Label = fct_reorder(Label, log2FoldChange))
+    
+    y_style <- if (tolower(label_by) %in% c("genus", "species", "family"))
+      element_text(face = "italic") else element_text()
+    
+    p_barchart <- ggplot(plot_data_barchart, aes(x = log2FoldChange, y = Label, fill = change)) +
+      geom_col(alpha = 1) +
+      geom_vline(xintercept = 0, linetype = "solid", color = "black") +
+      scale_fill_manual(values = color_map) +
+      labs(x = "log2(Fold Change)", y = label_by,
+           title = paste("Top", top_n, "Differentially Abundant Taxa")) +
+      theme_bw() +
+      theme(legend.position = "none",
+            axis.text.y = y_style,
+            plot.title = element_text(hjust = 0.5, size = 12),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank())
+  }
+  
+  # 返回图形对象（可后续保存）
+  return(list(volcano = p_volcano, barchart = p_barchart, title = groups_title))
+}
+
+# ---------- 6. 分别生成三组比较的图形并保存 ----------
+comparisons <- list(
+  list(csv = "results_Good_vs_Moderate.csv", up = "Good", down = "Moderate"),
+  list(csv = "results_Good_vs_Poor.csv",     up = "Good", down = "Poor"),
+  list(csv = "results_Moderate_vs_Poor.csv", up = "Moderate", down = "Poor")
+)
+
+for (comp in comparisons) {
+  color_map <- make_color_map(comp$up, comp$down)
+  res <- plot_comparison(
+    csv_path      = comp$csv,
+    up_group      = comp$up,
+    down_group    = comp$down,
+    color_map     = color_map,
+    label_by      = label_by,
+    log2fc_thresh = log2fc_thresh,
+    padj_thresh   = padj_thresh,
+    top_n         = top_n_barchart
+  )
+  
+  # 显示图形（可选）
+  print(res$volcano)
+  print(res$barchart)
+  
+  # 保存为 PDF/PNG
+  base_name <- tolower(gsub(" ", "_", res$title))
+  ggsave(paste0(base_name, "_volcano.pdf"),  plot = res$volcano,  width = 4, height = 4)
+  ggsave(paste0(base_name, "_barchart.pdf"), plot = res$barchart, width = 4, height = 4)
+}
+

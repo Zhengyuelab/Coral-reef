@@ -1,0 +1,328 @@
+# ==============================================================================
+#    Advanced Ternary Plot & Pie Chart Analysis Script (v24 - Final Unified Logic)
+#
+# Objectives:
+#   1. Plot Ternary Diagrams colored by [Global Top 10] "Orders".
+#   2. Plot Regional Composition Pie Charts where "Orders" and colors
+#      match the Ternary Diagram [Exactly], ensuring perfect visual unity.
+# ==============================================================================
+
+# ---------- 1. Environment Setup ----------
+rm(list = ls())
+library(tidyverse)
+library(Ternary)
+library(tibble)
+library(RColorBrewer)
+library(scales)
+
+# *** !!! Set your working directory here !!! ***
+# setwd("path/to/08_volcona/prokaryote_eukaryote_allcolor")
+
+# ---------- 2. Load Input Files ----------
+cat("--- Step 2: Loading input data... ---\n")
+required_files <- c("asv_sampling.csv", "sample_sampling.csv", "tax_table.csv")
+if (!all(file.exists(required_files))) {
+  stop("Error: One or more required input files are missing. Please check: ",
+       paste(required_files, collapse = ", "))
+}
+
+asv_table      <- read.csv("asv_sampling.csv",   row.names = 1, check.names = FALSE)
+meta_data      <- read.csv("sample_sampling.csv", row.names = 1)
+taxonomy_table <- read.csv("tax_table.csv",      row.names = 1)
+cat("Data loaded successfully!\n\n")
+
+# ---------- 3. Prepare Data ----------
+cat("--- Step 3: Preparing data and defining dominant regions... ---\n")
+
+# 转置并计算相对丰度
+asv_table_transposed <- as.data.frame(t(asv_table))
+sample_sums <- rowSums(asv_table_transposed)
+sample_sums[sample_sums == 0] <- 1
+relative_abundance_transposed <- sweep(asv_table_transposed, 1, sample_sums, FUN = "/")
+relative_abundance <- as.data.frame(t(relative_abundance_transposed))
+
+# 提取各健康状态样本
+good_samples     <- rownames(meta_data[meta_data$Group == "Good", ])
+moderate_samples <- rownames(meta_data[meta_data$Group == "Moderate", ])
+poor_samples     <- rownames(meta_data[meta_data$Group == "Poor", ])
+
+# 构建三元图基础数据
+ternary_data_raw <- data.frame(
+  ASV_ID   = rownames(relative_abundance),
+  Good     = rowMeans(relative_abundance[, good_samples], na.rm = TRUE),
+  Moderate = rowMeans(relative_abundance[, moderate_samples], na.rm = TRUE),
+  Poor     = rowMeans(relative_abundance[, poor_samples], na.rm = TRUE)
+)
+
+# 合并分类信息（仅保留 Kingdom 和 Order）
+taxonomy_for_join <- taxonomy_table %>%
+  tibble::rownames_to_column(var = "ASV_ID") %>%
+  select(ASV_ID, Kingdom, Order)
+
+final_data <- ternary_data_raw %>%
+  left_join(taxonomy_for_join, by = "ASV_ID") %>%
+  filter(Good > 0 | Moderate > 0 | Poor > 0) %>%
+  filter(!is.na(Order) & Order != "") %>%
+  mutate(TotalMeanAbundance = Good + Moderate + Poor)
+
+# 判断优势区域
+final_data <- final_data %>%
+  mutate(dominant_region = case_when(
+    Good > Moderate & Good > Poor ~ "Good Dominant",
+    Moderate > Good & Moderate > Poor ~ "Moderate Dominant",
+    Poor > Good & Poor > Moderate ~ "Poor Dominant",
+    TRUE ~ "Boundary/Tie"
+  ))
+
+# 按界划分数据
+prokaryote_data <- final_data %>%
+  filter(Kingdom == "d__Bacteria" | Kingdom == "d__Archaea")
+eukaryote_data <- final_data %>%
+  filter(Kingdom == "d__Eukaryota")
+
+cat("Data preparation complete!\n\n")
+
+# ---------- 4. Ternary Plot Function ----------
+cat("--- Step 4: Define Ternary Plot function... ---\n")
+
+plot_ternary_unified <- function(data, title, top_orders_list) {
+  if (nrow(data) == 0) {
+    plot(1, type = "n", axes = FALSE, xlab = "", ylab = "")
+    title(paste0(title, "\n(No ASVs found)"))
+    return()
+  }
+
+  # 绘制三元坐标底图
+  TernaryPlot(
+    alab = "Good (Top)", lab.cex = 1.2,
+    blab = "Moderate (Left)", clab = "Poor (Right)",
+    grid.lines = 5, grid.lty = 'dashed', grid.col = 'grey80',
+    axis.ticks  = seq(0, 100, by = 20),
+    axis.labels = seq(0, 100, by = 20),
+    axis.col    = "black",
+    ticks.cex   = 0.8
+  )
+  title(main = title, cex.main = 1.5)
+
+  # 添加分割线
+  center_point <- c(1/3, 1/3, 1/3)
+  TernaryLines(
+    list(center_point, c(0.5, 0, 0.5)),
+    coords = data.frame(x = c(1/3, 0.5), y = c(1/3, 0), z = c(1/3, 0.5)),
+    col = 'darkgrey', lty = 'dotted', lwd = 1.5
+  )
+  TernaryLines(
+    list(center_point, c(0.5, 0.5, 0)),
+    coords = data.frame(x = c(1/3, 0.5), y = c(1/3, 0.5), z = c(1/3, 0)),
+    col = 'darkgrey', lty = 'dotted', lwd = 1.5
+  )
+  TernaryLines(
+    list(center_point, c(0, 0.5, 0.5)),
+    coords = data.frame(x = c(1/3, 0), y = c(1/3, 0.5), z = c(1/3, 0.5)),
+    col = 'darkgrey', lty = 'dotted', lwd = 1.5
+  )
+
+  # 设置颜色分组顺序
+  order_levels <- c(top_orders_list, "Others")
+  data$Order_color_group <- factor(data$Order_color_group, levels = order_levels)
+
+  unique_orders <- levels(data$Order_color_group)
+  num_colors <- length(unique_orders)
+  colors <- brewer.pal(max(3, min(11, num_colors)), "Paired")
+  if (num_colors > 12) colors <- scales::hue_pal()(num_colors)
+
+  color_map <- setNames(colors[1:num_colors], unique_orders)
+  if ("Others" %in% names(color_map)) color_map["Others"] <- "grey60"
+
+  # 点大小映射总丰度
+  point_sizes <- scales::rescale(data$TotalMeanAbundance, to = c(0.8, 8))
+  point_colors <- color_map[data$Order_color_group]
+
+  TernaryPoints(
+    data[, c("Good", "Moderate", "Poor")],
+    col = alpha(point_colors, 0.7),
+    pch = 16,
+    cex = point_sizes
+  )
+
+  # 图例：分类群颜色
+  legend(
+    'topright',
+    legend = names(color_map),
+    col = color_map,
+    pch = 16,
+    bty = 'n',
+    cex = 0.8,
+    title = "Overall Top 10 Orders"
+  )
+
+  # 图例：点大小（总丰度）
+  abun_range <- range(data$TotalMeanAbundance)
+  legend_abun_values <- pretty(abun_range, n = 3)
+  legend_abun_values <- legend_abun_values[legend_abun_values > 0]
+  if (length(legend_abun_values) < 2) {
+    legend_abun_values <- quantile(data$TotalMeanAbundance, probs = c(0.1, 0.5, 0.9))
+    legend_abun_values <- unique(round(legend_abun_values, 4))
+  }
+  size_range <- c(0.8, 8)
+  legend_cex_values <- scales::rescale(legend_abun_values, to = size_range,
+                                       from = abun_range)
+  legend_labels <- scales::percent(legend_abun_values, accuracy = 0.1)
+  legend(
+    'bottomleft',
+    legend = legend_labels,
+    pt.cex = legend_cex_values,
+    pch = 21, pt.bg = "grey80", col = "black",
+    bty = 'n', cex = 0.8,
+    title = "Total Rel. Abundance"
+  )
+}
+
+# ---------- 5. Generate Global Top 10 & Ternary Plots ----------
+cat("--- Step 5: Prepare Global Top 10 list and generate Ternary Plots... ---\n")
+
+# Prokaryotes Global Top 10
+prok_order_abundance <- prokaryote_data %>%
+  group_by(Order) %>%
+  summarise(OrderTotalAbundance = sum(TotalMeanAbundance))
+prok_top_10 <- prok_order_abundance %>%
+  arrange(desc(OrderTotalAbundance)) %>%
+  slice_head(n = 10) %>%
+  pull(Order)
+prokaryote_data <- prokaryote_data %>%
+  mutate(Order_color_group = ifelse(Order %in% prok_top_10,
+                                    as.character(Order), "Others"))
+
+# Eukaryotes Global Top 10
+euk_order_abundance <- eukaryote_data %>%
+  group_by(Order) %>%
+  summarise(OrderTotalAbundance = sum(TotalMeanAbundance))
+euk_top_10 <- euk_order_abundance %>%
+  arrange(desc(OrderTotalAbundance)) %>%
+  slice_head(n = 10) %>%
+  pull(Order)
+eukaryote_data <- eukaryote_data %>%
+  mutate(Order_color_group = ifelse(Order %in% euk_top_10,
+                                    as.character(Order), "Others"))
+
+# 绘制并保存三元图
+output_filename_base_ternary <- "Ternary_Plots_Unified"
+
+png(paste0(output_filename_base_ternary, ".png"),
+    width = 16, height = 8.5, units = "in", res = 300)
+par(mfrow = c(1, 2), mar = c(5, 4, 5, 2) + 0.1, oma = c(0, 0, 3, 0))
+plot_ternary_unified(prokaryote_data, "Prokaryotes", prok_top_10)
+plot_ternary_unified(eukaryote_data, "Eukaryotes", euk_top_10)
+mtext("Relative Abundance of ASVs across Health States",
+      outer = TRUE, cex = 1.8, font = 2)
+dev.off()
+
+pdf(paste0(output_filename_base_ternary, ".pdf"),
+    width = 16, height = 8.5)
+par(mfrow = c(1, 2), mar = c(5, 4, 5, 2) + 0.1, oma = c(0, 0, 3, 0))
+plot_ternary_unified(prokaryote_data, "Prokaryotes", prok_top_10)
+plot_ternary_unified(eukaryote_data, "Eukaryotes", euk_top_10)
+mtext("Relative Abundance of ASVs across Health States",
+      outer = TRUE, cex = 1.8, font = 2)
+dev.off()
+cat("Ternary plots saved!\n\n")
+
+# ---------- 6. Pie Chart Function (Unified Logic) ----------
+cat("--- Step 6: Define function for Unified Regional Composition Pie Charts... ---\n")
+
+plot_unified_pies <- function(data, title, top_orders_list) {
+  # 使用已定义的 Global Top 10 颜色分组，计算每个优势区域的 ASV 数量
+  pie_data <- data %>%
+    filter(dominant_region != "Boundary/Tie") %>%
+    group_by(dominant_region, Order_color_group) %>%
+    summarise(asv_count = n(), .groups = 'drop')
+
+  all_regions <- c("Good Dominant", "Moderate Dominant", "Poor Dominant")
+  pie_data$dominant_region <- factor(pie_data$dominant_region, levels = all_regions)
+
+  # 保持与三元图一致的颜色
+  order_levels <- c(top_orders_list, "Others")
+  pie_data$Order_color_group <- factor(pie_data$Order_color_group, levels = order_levels)
+
+  num_colors <- length(order_levels)
+  colors <- brewer.pal(max(3, min(11, num_colors)), "Paired")
+  if (num_colors > 12) colors <- scales::hue_pal()(num_colors)
+  color_map <- setNames(colors[1:num_colors], order_levels)
+  if ("Others" %in% names(color_map)) color_map["Others"] <- "grey60"
+
+  # 绘图
+  p <- ggplot(pie_data, aes(x = "", y = asv_count, fill = Order_color_group)) +
+    geom_bar(stat = "identity", width = 1, color = "white") +
+    coord_polar("y", start = 0) +
+    facet_wrap(~ dominant_region, ncol = 3, drop = FALSE) +
+    theme_void() +
+    scale_fill_manual(values = color_map, name = "Overall Top 10 Orders") +
+    labs(title = title) +
+    theme(
+      plot.title   = element_text(hjust = 0.5, size = 16, face = "bold"),
+      strip.text   = element_text(size = 12, face = "bold"),
+      legend.position = "bottom"
+    ) +
+    guides(fill = guide_legend(ncol = 2))
+
+  # 处理空区域：添加提示文本
+  data_summary <- pie_data %>%
+    group_by(dominant_region) %>%
+    summarise(total = sum(asv_count))
+  empty_regions <- data.frame(
+    dominant_region = factor(setdiff(all_regions, data_summary$dominant_region),
+                             levels = all_regions)
+  )
+  if (nrow(empty_regions) > 0) {
+    p <- p + geom_text(
+      data = empty_regions,
+      aes(x = 0, y = 0, label = "No ASVs in this region"),
+      inherit.aes = FALSE, size = 4, color = "grey50"
+    )
+  }
+
+  return(list(plot = p, data = pie_data))
+}
+
+# ---------- 7. Generate and Save Pie Charts & Data ----------
+output_filename_base_pies <- "Pie_Charts_Unified_Composition"
+cat("--- Step 7: Generating and saving unified pie charts and source data... ---\n")
+
+# Prokaryotes
+prok_pie_result <- plot_unified_pies(prokaryote_data,
+                                     "Prokaryotes: Regional Composition of Overall Top Orders",
+                                     prok_top_10)
+
+ggsave(paste0(output_filename_base_pies, "_Prokaryotes.png"),
+       plot = prok_pie_result$plot, width = 14, height = 7, dpi = 300)
+ggsave(paste0(output_filename_base_pies, "_Prokaryotes.pdf"),
+       plot = prok_pie_result$plot, width = 14, height = 7)
+
+prok_pie_data_with_percent <- prok_pie_result$data %>%
+  group_by(dominant_region) %>%
+  mutate(Percentage = asv_count / sum(asv_count) * 100) %>%
+  ungroup()
+write.csv(prok_pie_data_with_percent,
+          paste0(output_filename_base_pies, "_Prokaryotes_data.csv"),
+          row.names = FALSE)
+
+# Eukaryotes
+euk_pie_result <- plot_unified_pies(eukaryote_data,
+                                    "Eukaryotes: Regional Composition of Overall Top Orders",
+                                    euk_top_10)
+
+ggsave(paste0(output_filename_base_pies, "_Eukaryotes.png"),
+       plot = euk_pie_result$plot, width = 14, height = 7, dpi = 300)
+ggsave(paste0(output_filename_base_pies, "_Eukaryotes.pdf"),
+       plot = euk_pie_result$plot, width = 14, height = 7)
+
+euk_pie_data_with_percent <- euk_pie_result$data %>%
+  group_by(dominant_region) %>%
+  mutate(Percentage = asv_count / sum(asv_count) * 100) %>%
+  ungroup()
+write.csv(euk_pie_data_with_percent,
+          paste0(output_filename_base_pies, "_Eukaryotes_data.csv"),
+          row.names = FALSE)
+
+cat("Pie charts and source CSV files saved successfully!\n\n")
+cat("Analysis complete.\n")

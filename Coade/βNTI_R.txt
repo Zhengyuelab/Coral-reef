@@ -1,0 +1,216 @@
+# --------------------------------------------------------------------------------------------------------
+# --------------------------------------------- 05. Community Assembly Process ---------------------------
+# --------------------------------------------------------------------------------------------------------
+### βNTI
+
+library(iCAMP)
+library(ggtree)
+# # Using example.data from iCAMP package as an example
+
+setwd("code/βNTI/Data")
+
+comm = read.csv("asv_sampling.csv", header = T, row.names = 1)
+comm <- data.frame(t(comm), check.names = FALSE)
+tree = read.tree("filtered_tree.tree")
+# tree = read.tree("tree_analysis.tree")
+# Calculate phylogenetic distance based on the tree
+pd <- cophenetic(tree) 
+
+# Community assembly analysis based on Stegen et al (2013 and 2015)
+# See ?qpen for details. Default thresholds: βNTI=2 and RC=0.95. 
+# 1000 randomizations for null distribution, executed with 32 threads.
+set.seed(123)
+qpen.out <- qpen(comm = comm, pd = pd, sig.bNTI = 2, sig.rc = 0.95, rand.time = 1000, nworker = 32)
+
+qpen.out$ratio  # Proportions of Heterogeneous.Selection, Homogeneous.Selection, Dispersal.Limitation, Homogenizing.Dispersal, and Undominated (Drift)
+head(qpen.out$result)  # bMNTD, BC, bNTI, RC values and dominant ecological process for each sample pair
+
+# Output
+write.csv(qpen.out, 'qpen_out16s.csv', row.names = FALSE)
+write.csv(qpen.out, 'qpen_out18s.csv', row.names = FALSE)
+
+# =========================================================================
+# iCAMP Community Assembly Analysis Script (With Intelligent Pre-filtering)
+# Use this for the overall βNTI model including filtering
+# =========================================================================
+# --- 1. Load Required Packages ---
+library(iCAMP)
+library(ape)     # For handling phylogenetic trees
+library(dplyr)   # For data manipulation
+# setwd("path/to/07_community_assembly/All/prokaryote")
+# setwd("path/to/07_community_assembly/All/eukaryote")
+
+# --- 2. Load Raw Data ---
+cat("--- Loading raw data... ---\n")
+# Note: comm format needs to be samples (rows) x species (columns)
+comm_orig <- read.csv("asv_sampling.csv", header = TRUE, row.names = 1)
+comm_orig <- data.frame(t(comm_orig), check.names = FALSE)
+
+tree_orig <- read.tree("filtered_tree.tree")
+
+# Print raw data dimensions
+cat(paste("Raw community data dimensions:", nrow(comm_orig), "samples x", ncol(comm_orig), "ASVs.\n"))
+cat(paste("Raw phylogenetic tree contains:", length(tree_orig$tip.label), "tips.\n"))
+
+# =========================================================================
+# --- 3. Intelligent Pre-filtering Step (Core Section) ---
+# =========================================================================
+cat("\n--- Starting Intelligent Pre-filtering... ---\n")
+
+# --- Filtering Criteria Settings (Adjustable Key Parameters) ---
+
+# a. Remove ASVs with extremely low total abundance
+# An ASV must have a total read count greater than this value across all samples to be kept.
+# Effectively removes sequencing errors or extremely rare sequences.
+min_total_abundance <- 10 # Recommended: 5-10
+
+# b. Remove ASVs with extremely low prevalence
+# An ASV must appear in at least X samples to be kept.
+# Removes "transient" species that appear accidentally in a single sample.
+min_prevalence_samples <- 2 # Recommended: 2-3, or 1-5% of total samples
+
+# --- Execute Filtering ---
+# Step 3.1: Filter by Total Abundance
+total_abundances <- colSums(comm_orig)
+asvs_to_keep_by_abundance <- names(total_abundances[total_abundances > min_total_abundance])
+comm_filtered_1 <- comm_orig[, asvs_to_keep_by_abundance]
+cat(paste("After abundance filtering, retained", ncol(comm_filtered_1), "ASVs.\n"))
+
+# Step 3.2: Filter by Prevalence (on already filtered data)
+# Count abundance > 0 as 1, else 0, then sum by column to get sample count per ASV
+prevalence <- colSums(comm_filtered_1 > 0)
+asvs_to_keep_by_prevalence <- names(prevalence[prevalence >= min_prevalence_samples])
+comm_filtered_2 <- comm_filtered_1[, asvs_to_keep_by_prevalence]
+cat(paste("After prevalence filtering, finally retained", ncol(comm_filtered_2), "ASVs.\n"))
+
+# Step 3.3: Synchronize Phylogenetic Tree
+# Tree tips must perfectly match ASVs in community data
+# `prune.sample` in iCAMP is convenient, but manual operation is clearer here
+final_asvs_to_keep <- colnames(comm_filtered_2)
+tree_filtered <- keep.tip(tree_orig, tip = final_asvs_to_keep)
+cat(paste("Tree synchronized, retained", length(tree_filtered$tip.label), "tips.\n"))
+
+# Step 3.4: Ensure ASV order in community data matches tree (Very Important!)
+comm_final <- comm_filtered_2[, tree_filtered$tip.label]
+
+# --- Confirm Final Filtered Data ---
+cat("\n--- Pre-filtering complete! Final dimensions for analysis: ---\n")
+cat(paste("Community data:", nrow(comm_final), "samples x", ncol(comm_final), "ASVs.\n"))
+cat(paste("Phylogenetic tree contains:", length(tree_filtered$tip.label), "tips.\n"))
+
+
+# =========================================================================
+# --- 4. Run iCAMP Community Assembly Analysis (Using Filtered Data) ---
+# =========================================================================
+cat("\n--- Running iCAMP qpen analysis... ---\n")
+
+# Calculate phylogenetic distance using filtered tree
+pd <- cophenetic(tree_filtered) 
+
+# Run qpen function using filtered comm and pd
+set.seed(123)
+qpen.out <- qpen(comm = comm_final, pd = pd, sig.bNTI = 2, sig.rc = 0.95, rand.time = 1000, nworker = 32)
+
+# # --- 5. View and Save Results (Same as previous code) ---
+# cat("\n--- iCAMP analysis complete! Summary: ---\n")
+# print(qpen.out$ratio)  # Print process ratios
+# print(head(qpen.out$result)) # Print result details
+# # Output result
+# write.csv(qpen.out$result, 'qpen_out_result.csv', row.names = FALSE)
+# # Output
+write.csv(qpen.out, 'qpen_out16s.csv', row.names = FALSE)
+write.csv(qpen.out, 'qpen_out18s.csv', row.names = FALSE)
+# # Save ratios
+# capture.output(qpen.out$ratio, file = "qpen_out_ratio.txt")
+# cat("\n--- All analysis and export complete! ---\n")
+
+
+# Visualization Plotting
+library(dplyr)
+
+bnti <- read.csv("qpen_out16s.csv", header = T)
+bnti <- read.csv("qpen_out18s.csv", header = T)
+bnti1 <- bnti[,7:13]
+colnames(bnti1) <- c("sample1", "sample2", "bMNTD", "BC", "bNTI", "RC", "process")
+sample <- read.csv("sample_sampling.csv", header = T)
+head(sample)
+
+# Rename sample to avoid conflict
+sample1 <- sample %>% rename(Group1 = Group)
+sample2 <- sample %>% rename(Group2 = Group)
+
+# Use left_join() for matching and merging
+bnti1 <- bnti1 %>%
+  left_join(sample1, by = c("sample1" = "SampleID")) %>%
+  left_join(sample2, by = c("sample2" = "SampleID"))
+
+# Check merged dataframe
+head(bnti1)
+
+# Plotting
+library(ggplot2)
+library(dplyr)
+
+# Create a new dataframe containing only necessary columns
+bnti_filtered <- bnti1 %>%
+  filter(Group1 == Group2) %>%  # Filter rows where Group1 and Group2 are the same
+  select(bNTI, Group = Group1)  # Select bNTI and Group column
+
+# Set Group as factor and define plotting order
+bnti_filtered$Group <- factor(bnti_filtered$Group, levels = c("Poor", "Moderate", "Good"))
+
+# Use ggplot2 to plot boxplot
+p1 <- ggplot(bnti_filtered, aes(x = Group, y = bNTI, fill = Group)) +
+  geom_boxplot(alpha = 1, width = 0.4, size = 0.5) +
+  scale_fill_manual(values = c("Poor" = "#ED8D5A",   # Red
+                               "Moderate" = "#EFCE87",# Light Yellow
+                               "Good" = "#72B063")) +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +  # Remove grid lines
+  geom_hline(yintercept = -2, linetype = 2, size = 1, color = "grey") +  # Add grey dashed line
+  geom_hline(yintercept = 2, linetype = 2, size = 1, color = "grey")     # Add grey dashed line
+p1
+
+# Plot process percentage stacked bar chart
+# Filter data, keeping only rows where Group1 and Group2 are the same
+data_filtered2 <- bnti1 %>%
+  filter(Group1 == Group2) %>%
+  select(Group = Group1, process)  # Select Group and process columns
+
+# Set Group as factor and define plotting order
+data_filtered2$Group <- factor(data_filtered2$Group, levels = c("Poor", "Moderate", "Good"))
+
+# Calculate percentage of each ecological process in each group
+data_percent <- data_filtered2 %>%
+  group_by(Group, process) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  group_by(Group) %>%
+  mutate(Percentage = Count / sum(Count) * 100) %>%
+  ungroup()
+
+write.csv(data_percent, 'assembly_percentage.csv', row.names = FALSE)
+
+process_colors <- c(
+  "Homogeneous.Selection" = "#87BBD6",   # Red
+  "Undominated" = "#F6D7C4",             # Orange
+  "Heterogeneous.Selection" = "#0563A1", # Light Yellow
+  "Dispersal.Limitation" = "#E49E7F",    # Light Blue
+  "Homogenizing.Dispersal" = "#BD1A24",                    # Blue
+  "Other" = "#313695"                    # Dark Blue
+)
+
+# Plot stacked bar chart
+p2 <- ggplot(data_percent, aes(x = Group, y = Percentage, fill = process)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = process_colors) +  # Use custom colors
+  labs(y = "Ecological Processes (%)", x = "Group") +
+  theme_bw() +
+  theme(panel.grid = element_blank()) # Remove grid lines
+p2
+
+library(patchwork)
+p3 <- p1 / p2
+p3
+ggsave("16s_bnti.pdf", plot = p3, width = 5, height = 5.5)
+ggsave("18s_bnti.pdf", plot = p3, width = 5, height = 5.5)
+

@@ -1,0 +1,136 @@
+# ============================================================
+# Bray-Curtis pairwise distance + near-distance segmented regression
+# ============================================================
+
+# ---------- 0. 加载包 ----------
+library(vegan)
+library(segmented)
+library(tidyverse)
+
+# ---------- 1. 路径与参数 ----------
+setwd("/code/Piecewise regression/Data")
+
+otu_file    <- "otutable.csv"
+sample_file <- "sample_Distance.csv"
+output_pdf  <- "Near_distance_gradient_segmented_regression.pdf"
+near_distance_upper <- 1.5   # 近距离梯度上限（km）
+
+# ---------- 2. 读取数据 ----------
+otu_raw <- read.csv(otu_file, check.names = FALSE, stringsAsFactors = FALSE)
+sample_info <- read.csv(sample_file, check.names = FALSE, stringsAsFactors = FALSE,
+                        fileEncoding = "UTF-8-BOM")
+
+# 统一列名
+colnames(otu_raw)[1] <- "otu_id"
+colnames(sample_info)[1] <- "sample_id"
+colnames(sample_info)[2] <- "Distance"
+sample_info$sample_id <- trimws(as.character(sample_info$sample_id))
+sample_info$Distance <- as.numeric(sample_info$Distance)
+
+# ---------- 3. 构建样品 × ASV 丰度矩阵 ----------
+otu_mat <- otu_raw %>%
+  column_to_rownames("otu_id") %>%
+  as.matrix()
+storage.mode(otu_mat) <- "numeric"
+abund_mat <- t(otu_mat)          # 样品为行，ASV为列
+rownames(abund_mat) <- trimws(rownames(abund_mat))
+
+# 匹配样品
+common_samples <- intersect(rownames(abund_mat), sample_info$sample_id)
+if (length(common_samples) < 3) stop("匹配样品数过少，请检查样品名。")
+abund_mat <- abund_mat[common_samples, , drop = FALSE]
+sample_info <- sample_info %>%
+  filter(sample_id %in% common_samples) %>%
+  arrange(match(sample_id, rownames(abund_mat)))
+stopifnot(all(rownames(abund_mat) == sample_info$sample_id))
+
+# 删除全零样品和ASV
+abund_mat <- abund_mat[rowSums(abund_mat) > 0, , drop = FALSE]
+sample_info <- sample_info %>% filter(sample_id %in% rownames(abund_mat))
+abund_mat <- abund_mat[, colSums(abund_mat) > 0, drop = FALSE]
+stopifnot(all(rownames(abund_mat) == sample_info$sample_id))
+
+# ---------- 4. 相对丰度与 Bray-Curtis 距离 ----------
+abund_rel <- decostand(abund_mat, method = "total")
+bray_dist <- vegdist(abund_rel, method = "bray")
+bray_mat <- as.matrix(bray_dist)
+
+# 地理距离
+distance_vec <- sample_info$Distance
+names(distance_vec) <- sample_info$sample_id
+distance_vec <- distance_vec[rownames(bray_mat)]
+geo_dist_mat <- as.matrix(dist(distance_vec, method = "euclidean"))
+rownames(geo_dist_mat) <- colnames(geo_dist_mat) <- rownames(bray_mat)
+
+# ---------- 5. 下三角转换为两两配对数据 ----------
+lower_index <- lower.tri(bray_mat)
+pairwise_df <- data.frame(
+  sample1 = rownames(bray_mat)[row(bray_mat)[lower_index]],
+  sample2 = colnames(bray_mat)[col(bray_mat)[lower_index]],
+  pairwise_distance = geo_dist_mat[lower_index],
+  bray_dissimilarity = bray_mat[lower_index]
+) %>%
+  filter(pairwise_distance > 0) %>%
+  arrange(pairwise_distance)
+
+# 近距离子集
+pairwise_df_near <- pairwise_df %>% filter(pairwise_distance <= near_distance_upper)
+if (nrow(pairwise_df_near) < 10) stop("近距离样品对过少，请增大 near_distance_upper。")
+
+# ---------- 6. 近距离线性模型 ----------
+lm_fit_near <- lm(bray_dissimilarity ~ pairwise_distance, data = pairwise_df_near)
+
+# ---------- 7. 分段回归（AIC 选择最佳断点） ----------
+candidate_psi <- seq(
+  from = quantile(pairwise_df_near$pairwise_distance, 0.20, na.rm = TRUE),
+  to   = quantile(pairwise_df_near$pairwise_distance, 0.80, na.rm = TRUE),
+  length.out = 15
+)
+candidate_psi <- unique(candidate_psi)
+candidate_psi <- candidate_psi[candidate_psi > min(pairwise_df_near$pairwise_distance) &
+                                 candidate_psi < max(pairwise_df_near$pairwise_distance)]
+
+seg_models <- list()
+for (psi in candidate_psi) {
+  fit <- try(segmented(lm_fit_near, seg.Z = ~ pairwise_distance, psi = psi,
+                       control = seg.control(it.max = 200, n.boot = 200, display = FALSE)),
+             silent = TRUE)
+  if (!inherits(fit, "try-error")) seg_models[[paste0("psi_", round(psi, 4))]] <- fit
+}
+if (length(seg_models) == 0) stop("分段回归均未收敛。")
+
+aic_vals <- sapply(seg_models, AIC)
+best_model <- seg_models[[which.min(aic_vals)]]
+breakpoint <- best_model$psi[, "Est."]
+breakpoint_se <- best_model$psi[, "St.Err"]
+
+# ---------- 8. 绘制并保存 ----------
+pred_df <- data.frame(
+  pairwise_distance = seq(min(pairwise_df_near$pairwise_distance),
+                          max(pairwise_df_near$pairwise_distance), length.out = 300)
+)
+pred_df$predicted_bray <- predict(best_model, newdata = pred_df)
+
+p_near <- ggplot(pairwise_df_near, aes(x = pairwise_distance, y = bray_dissimilarity)) +
+  geom_point(size = 2.5, alpha = 0.55) +
+  geom_line(data = pred_df, aes(y = predicted_bray), linewidth = 1) +
+  geom_vline(xintercept = breakpoint, linetype = "dashed", linewidth = 0.8) +
+  labs(x = "Pairwise distance difference",
+       y = "Pairwise Bray-Curtis dissimilarity",
+       title = "Sensitivity analysis based on near-distance gradient",
+       subtitle = paste0("Estimated breakpoint = ", round(breakpoint, 4), " km, ",
+                         round(breakpoint * 1000, 1), " m")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ggsave(output_pdf, p_near, width = 7, height = 5)
+
+# ---------- 9. 输出统计结果 ----------
+cat("\n普通线性模型 AIC:", AIC(lm_fit_near), "\n")
+cat("分段回归 AIC:", AIC(best_model), "\n")
+cat("断点:", breakpoint, "km (", breakpoint * 1000, "m )\n")
+cat("断点标准误:", breakpoint_se, "\n")
+cat("断点95%置信区间:\n"); print(confint(best_model))
+cat("分段斜率:\n"); print(slope(best_model))
+cat("\n分析完成，保存文件:", output_pdf, "\n")
+

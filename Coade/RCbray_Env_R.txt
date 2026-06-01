@@ -1,0 +1,605 @@
+# ============================================================
+# βNTI / RCbray community assembly + environmental effects
+# 保留原始过滤条件：min_total_abundance <- 10, min_prevalence_samples <- 2
+#
+# 逻辑：
+# 1. 先严格按照原始流程运行 qpen
+# 2. 再合并环境因子和 Good / Moderate / Poor 分组
+# 3. 分组评估环境因子对组装过程的影响
+# ============================================================
+
+# -----------------------------
+# 0. Load packages
+# -----------------------------
+library(iCAMP)
+library(ape)
+library(vegan)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(rstatix)
+
+# -----------------------------
+# 1. Set working directory
+# -----------------------------
+setwd("/code/RCbray_Env/Data")
+
+# -----------------------------
+# 2. File paths and parameters
+# -----------------------------
+comm_file  <- "asv_sampling.csv"
+tree_file  <- "tree_analysis.tree"   # 或 "filtered_tree.tree"
+env_file   <- "022Env.csv"
+
+run_qpen     <- TRUE          # 是否重新运行 qpen
+out_prefix   <- "18S"         # 输出前缀（16S/18S）
+
+# ============================================================
+# Part I. Run qpen using original βNTI workflow
+# ============================================================
+if (run_qpen) {
+  
+  # -----------------------------
+  # 3. Read community table
+  # -----------------------------
+  cat("\n--- Loading community data ---\n")
+  
+  comm_raw <- read.csv(comm_file, header = TRUE, row.names = 1, check.names = FALSE)
+  
+  # 原始 ASV 表一般是 ASV × Sample，qpen 需要 Sample × ASV
+  comm_mat <- as.matrix(comm_raw)
+  mode(comm_mat) <- "numeric"
+  comm_orig <- as.data.frame(t(comm_mat), check.names = FALSE)
+  rownames(comm_orig) <- trimws(rownames(comm_orig))
+  colnames(comm_orig) <- trimws(colnames(comm_orig))
+  
+  cat("Raw community data:", nrow(comm_orig), "samples ×", ncol(comm_orig), "ASVs\n")
+  cat("Total reads in raw community table:", sum(comm_orig), "\n")
+  
+  if (nrow(comm_orig) < 3) stop("样品数少于 3，无法运行 qpen。")
+  if (ncol(comm_orig) < 2) stop("ASV 数少于 2，无法运行 qpen。")
+  if (sum(comm_orig) == 0) stop("群落矩阵总丰度为 0。")
+  
+  cat("Summary of total abundance per ASV before filtering:\n")
+  print(summary(colSums(comm_orig)))
+  cat("Summary of prevalence per ASV before filtering:\n")
+  print(summary(colSums(comm_orig > 0)))
+  
+  # -----------------------------
+  # 4. Read phylogenetic tree
+  # -----------------------------
+  cat("\n--- Loading phylogenetic tree ---\n")
+  
+  if (!file.exists(tree_file)) {
+    cat("Cannot find tree file:", tree_file, "\n")
+    cat("Files in current directory:\n")
+    print(list.files())
+    stop("系统发育树文件不存在，请检查 tree_file 设置。")
+  }
+  
+  tree_orig <- read.tree(tree_file)
+  tree_orig$tip.label <- trimws(tree_orig$tip.label)
+  cat("Raw phylogenetic tree tips:", length(tree_orig$tip.label), "\n")
+  
+  # -----------------------------
+  # 5. ASV filtering
+  # -----------------------------
+  cat("\n--- Starting ASV filtering ---\n")
+  
+  min_total_abundance   <- 10
+  min_prevalence_samples <- 2
+  
+  # Step 5.1: Filter by total abundance
+  total_abundances <- colSums(comm_orig)
+  asvs_to_keep_by_abundance <- names(total_abundances[total_abundances > min_total_abundance])
+  comm_filtered_1 <- comm_orig[, asvs_to_keep_by_abundance, drop = FALSE]
+  cat("After abundance filtering, retained", ncol(comm_filtered_1), "ASVs.\n")
+  
+  if (ncol(comm_filtered_1) == 0) {
+    stop(paste0("丰度过滤后 ASV 数为 0。请检查输入数据是否读取正确。"))
+  }
+  
+  # Step 5.2: Filter by prevalence
+  prevalence <- colSums(comm_filtered_1 > 0)
+  asvs_to_keep_by_prevalence <- names(prevalence[prevalence >= min_prevalence_samples])
+  comm_filtered_2 <- comm_filtered_1[, asvs_to_keep_by_prevalence, drop = FALSE]
+  cat("After prevalence filtering, finally retained", ncol(comm_filtered_2), "ASVs.\n")
+  
+  if (ncol(comm_filtered_2) == 0) {
+    stop(paste0("出现频率过滤后 ASV 数为 0。请检查输入数据。"))
+  }
+  
+  # -----------------------------
+  # 6. Synchronize tree and community table
+  # -----------------------------
+  cat("\n--- Synchronizing community table and phylogenetic tree ---\n")
+  
+  common_asvs <- intersect(colnames(comm_filtered_2), tree_orig$tip.label)
+  cat("Common ASVs between community table and tree:", length(common_asvs), "\n")
+  
+  if (length(common_asvs) == 0) {
+    stop("群落表 ASV 名和系统发育树 tip.label 没有交集。请检查树文件是否正确。")
+  }
+  if (length(common_asvs) < ncol(comm_filtered_2)) {
+    warning(paste0(ncol(comm_filtered_2) - length(common_asvs), " 个过滤后的 ASV 不在树中，将被移除。"))
+  }
+  
+  comm_filtered_2 <- comm_filtered_2[, common_asvs, drop = FALSE]
+  tree_filtered <- keep.tip(tree_orig, tip = common_asvs)
+  comm_final <- comm_filtered_2[, tree_filtered$tip.label, drop = FALSE]
+  
+  cat("Final community table:", nrow(comm_final), "samples ×", ncol(comm_final), "ASVs\n")
+  cat("Final tree tips:", length(tree_filtered$tip.label), "\n")
+  cat("Total reads in final community table:", sum(comm_final), "\n")
+  
+  if (ncol(comm_final) < 2) stop("最终 ASV 数少于 2，无法运行 qpen。")
+  if (nrow(comm_final) < 3) stop("最终样品数少于 3，无法运行 qpen。")
+  if (sum(comm_final) == 0) stop("最终群落矩阵总丰度为 0。")
+  
+  # -----------------------------
+  # 7. Run qpen
+  # -----------------------------
+  cat("\n--- Running qpen analysis ---\n")
+  
+  pd <- cophenetic(tree_filtered)
+  pd <- pd[colnames(comm_final), colnames(comm_final)]
+  
+  set.seed(123)
+  qpen.out <- qpen(comm = comm_final,
+                   pd = pd,
+                   sig.bNTI = 2,
+                   sig.rc = 0.95,
+                   rand.time = 1000,
+                   nworker = 32)
+  
+  qpen_result <- qpen.out$result
+  
+  write.csv(qpen_result, paste0(out_prefix, "_qpen_out_result.csv"), row.names = FALSE)
+  write.csv(qpen.out$ratio, paste0(out_prefix, "_qpen_out_ratio.csv"), row.names = TRUE)
+  capture.output(qpen.out$ratio, file = paste0(out_prefix, "_qpen_out_ratio.txt"))
+  
+  cat("\nqpen analysis completed.\n")
+  
+} else {
+  
+  qpen_result <- read.csv(paste0(out_prefix, "_qpen_out_result.csv"),
+                          header = TRUE, check.names = FALSE)
+}
+
+# ============================================================
+# Part II. Standardize qpen result
+# ============================================================
+cat("\n--- Standardizing qpen result ---\n")
+
+standardize_qpen_result <- function(x) {
+  cn <- colnames(x)
+  
+  if (all(c("sample1", "sample2", "bMNTD", "BC", "bNTI", "RC", "process") %in% cn)) {
+    y <- x[, c("sample1", "sample2", "bMNTD", "BC", "bNTI", "RC", "process")]
+  } else if (all(c("name1", "name2", "bMNTD", "BC", "bNTI", "RC", "process") %in% cn)) {
+    y <- x[, c("name1", "name2", "bMNTD", "BC", "bNTI", "RC", "process")]
+    colnames(y) <- c("sample1", "sample2", "bMNTD", "BC", "bNTI", "RC", "process")
+  } else if (ncol(x) >= 13) {
+    y <- x[, 7:13]
+    colnames(y) <- c("sample1", "sample2", "bMNTD", "BC", "bNTI", "RC", "process")
+  } else if (ncol(x) == 7) {
+    y <- x
+    colnames(y) <- c("sample1", "sample2", "bMNTD", "BC", "bNTI", "RC", "process")
+  } else {
+    stop("无法识别 qpen_result 的列名结构。")
+  }
+  
+  y$sample1 <- trimws(as.character(y$sample1))
+  y$sample2 <- trimws(as.character(y$sample2))
+  y$bMNTD  <- as.numeric(y$bMNTD)
+  y$BC     <- as.numeric(y$BC)
+  y$bNTI   <- as.numeric(y$bNTI)
+  y$RC     <- as.numeric(y$RC)
+  y$process <- as.character(y$process)
+  
+  return(y)
+}
+
+qpen_result2 <- standardize_qpen_result(qpen_result)
+write.csv(qpen_result2, paste0(out_prefix, "_qpen_out_result_standardized.csv"), row.names = FALSE)
+
+# ============================================================
+# Part III. Read environmental table
+# ============================================================
+cat("\n--- Loading environmental data ---\n")
+
+env <- read.csv(env_file, header = TRUE, check.names = FALSE, fileEncoding = "UTF-8-BOM")
+colnames(env) <- trimws(colnames(env))
+
+if ("SampleID" %in% colnames(env)) {
+  sample_col <- "SampleID"
+} else if ("Sample" %in% colnames(env)) {
+  sample_col <- "Sample"
+} else {
+  stop("环境因子表中需要有 SampleID 或 Sample 列。")
+}
+
+if (!"Group" %in% colnames(env)) stop("环境因子表中需要有 Group 列。")
+
+env[[sample_col]] <- trimws(as.character(env[[sample_col]]))
+env$Group <- trimws(as.character(env$Group))
+colnames(env)[colnames(env) == sample_col] <- "SampleID"
+env$Group <- factor(env$Group, levels = c("Poor", "Moderate", "Good"))
+rownames(env) <- env$SampleID
+
+env_data <- env %>%
+  select(-SampleID, -Group) %>%
+  mutate(across(everything(), ~ as.numeric(as.character(.))))
+rownames(env_data) <- env$SampleID
+
+complete_samples <- complete.cases(env_data)
+env <- env[complete_samples, , drop = FALSE]
+env_data <- env_data[complete_samples, , drop = FALSE]
+
+# ============================================================
+# Part IV. Merge qpen result with health group
+# ============================================================
+cat("\n--- Merging qpen result with group information ---\n")
+
+group_info <- env %>% select(SampleID, Group)
+
+sample1_info <- group_info %>% rename(sample1 = SampleID, Group1 = Group)
+sample2_info <- group_info %>% rename(sample2 = SampleID, Group2 = Group)
+
+assembly_pairwise <- qpen_result2 %>%
+  left_join(sample1_info, by = "sample1") %>%
+  left_join(sample2_info, by = "sample2")
+
+assembly_within_group <- assembly_pairwise %>%
+  filter(!is.na(Group1), !is.na(Group2)) %>%
+  filter(Group1 == Group2) %>%
+  mutate(Group = Group1)
+
+assembly_within_group$Group <- factor(assembly_within_group$Group, levels = c("Poor", "Moderate", "Good"))
+
+write.csv(assembly_within_group, paste0(out_prefix, "_assembly_pairwise_within_health_groups.csv"), row.names = FALSE)
+
+# ============================================================
+# Part V. Add environmental distances
+# ============================================================
+cat("\n--- Adding environmental distances ---\n")
+
+used_samples <- intersect(unique(c(assembly_within_group$sample1, assembly_within_group$sample2)),
+                          rownames(env_data))
+
+env_data_used <- env_data[used_samples, , drop = FALSE]
+env_scaled <- as.data.frame(scale(env_data_used))
+rownames(env_scaled) <- rownames(env_data_used)
+env_dist_mat <- as.matrix(dist(env_scaled, method = "euclidean"))
+
+assembly_within_group$Env_distance <- mapply(
+  function(x, y) env_dist_mat[x, y],
+  assembly_within_group$sample1,
+  assembly_within_group$sample2
+)
+
+env_factors <- colnames(env_data)
+for (v in env_factors) {
+  assembly_within_group[[paste0("diff_", v)]] <- mapply(
+    function(x, y) abs(env_data[x, v] - env_data[y, v]),
+    assembly_within_group$sample1,
+    assembly_within_group$sample2
+  )
+}
+
+assembly_within_group$abs_bNTI <- abs(assembly_within_group$bNTI)
+assembly_within_group$abs_RC   <- abs(assembly_within_group$RC)
+assembly_within_group$Assembly_type <- ifelse(abs(assembly_within_group$bNTI) > 2,
+                                              "Deterministic", "Stochastic")
+assembly_within_group$Assembly_type <- factor(assembly_within_group$Assembly_type,
+                                              levels = c("Deterministic", "Stochastic"))
+
+write.csv(assembly_within_group,
+          paste0(out_prefix, "_assembly_with_environmental_distance_by_group.csv"),
+          row.names = FALSE)
+
+# ============================================================
+# Part VI. Mantel test by group
+# ============================================================
+make_pairwise_matrix <- function(pairwise_df, samples, value_col) {
+  mat <- matrix(NA, nrow = length(samples), ncol = length(samples),
+                dimnames = list(samples, samples))
+  for (i in seq_len(nrow(pairwise_df))) {
+    s1 <- pairwise_df$sample1[i]
+    s2 <- pairwise_df$sample2[i]
+    if (s1 %in% samples && s2 %in% samples) {
+      mat[s1, s2] <- pairwise_df[[value_col]][i]
+      mat[s2, s1] <- mat[s1, s2]
+    }
+  }
+  diag(mat) <- 0
+  return(mat)
+}
+
+mantel_results <- data.frame()
+
+for (g in levels(assembly_within_group$Group)) {
+  pair_g <- assembly_within_group %>% filter(Group == g)
+  group_samples <- sort(unique(c(pair_g$sample1, pair_g$sample2)))
+  group_samples <- intersect(group_samples, rownames(env_scaled))
+  
+  if (length(group_samples) < 4 || nrow(pair_g) < 6) next
+  
+  env_dist_g <- dist(env_scaled[group_samples, ], method = "euclidean")
+  
+  bnti_mat_g <- make_pairwise_matrix(pair_g, group_samples, "abs_bNTI")
+  if (!any(is.na(bnti_mat_g))) {
+    mantel_bnti <- mantel(as.dist(bnti_mat_g), env_dist_g, method = "spearman", permutations = 999)
+    mantel_results <- rbind(mantel_results,
+                            data.frame(Group = g, Response = "abs_bNTI",
+                                       Mantel_r = mantel_bnti$statistic, P_value = mantel_bnti$signif))
+  }
+  
+  rc_mat_g <- make_pairwise_matrix(pair_g, group_samples, "abs_RC")
+  if (!any(is.na(rc_mat_g))) {
+    mantel_rc <- mantel(as.dist(rc_mat_g), env_dist_g, method = "spearman", permutations = 999)
+    mantel_results <- rbind(mantel_results,
+                            data.frame(Group = g, Response = "abs_RC",
+                                       Mantel_r = mantel_rc$statistic, P_value = mantel_rc$signif))
+  }
+}
+
+if (nrow(mantel_results) > 0) {
+  mantel_results$P_adj <- p.adjust(mantel_results$P_value, method = "BH")
+}
+write.csv(mantel_results, paste0(out_prefix, "_Mantel_environmental_distance_vs_assembly_by_group.csv"),
+          row.names = FALSE)
+
+# ============================================================
+# Part VII. Spearman correlation by group
+# ============================================================
+diff_cols <- grep("^diff_", colnames(assembly_within_group), value = TRUE)
+spearman_results <- data.frame()
+
+for (g in levels(assembly_within_group$Group)) {
+  df_g <- assembly_within_group %>% filter(Group == g)
+  for (v in diff_cols) {
+    if (length(unique(df_g[[v]])) < 2) next
+    
+    test_bnti <- suppressWarnings(cor.test(df_g[[v]], df_g$abs_bNTI, method = "spearman", exact = FALSE))
+    spearman_results <- rbind(spearman_results,
+                              data.frame(Group = g, Environmental_factor = gsub("^diff_", "", v),
+                                         Response = "abs_bNTI",
+                                         Spearman_rho = test_bnti$estimate, P_value = test_bnti$p.value))
+    
+    test_rc <- suppressWarnings(cor.test(df_g[[v]], df_g$abs_RC, method = "spearman", exact = FALSE))
+    spearman_results <- rbind(spearman_results,
+                              data.frame(Group = g, Environmental_factor = gsub("^diff_", "", v),
+                                         Response = "abs_RC",
+                                         Spearman_rho = test_rc$estimate, P_value = test_rc$p.value))
+  }
+}
+
+if (nrow(spearman_results) > 0) {
+  spearman_results <- spearman_results %>%
+    group_by(Group, Response) %>%
+    mutate(P_adj = p.adjust(P_value, method = "BH")) %>%
+    ungroup()
+}
+write.csv(spearman_results,
+          paste0(out_prefix, "_Spearman_each_environmental_factor_vs_assembly_by_group.csv"),
+          row.names = FALSE)
+
+# ============================================================
+# Part VIII. Kruskal-Wallis: Environmental distance among processes by group
+# ============================================================
+assembly_within_group$process <- factor(assembly_within_group$process,
+  levels = c("Heterogeneous.Selection","Homogeneous.Selection",
+             "Dispersal.Limitation","Homogenizing.Dispersal","Undominated"))
+
+kw_process_env <- data.frame()
+dunn_process_env <- data.frame()
+
+for (g in levels(assembly_within_group$Group)) {
+  df_g <- assembly_within_group %>% filter(Group == g, !is.na(process))
+  if (length(unique(df_g$process)) < 2) next
+  
+  kw_g <- df_g %>%
+    kruskal_test(Env_distance ~ process) %>%
+    mutate(Group = g)
+  kw_process_env <- rbind(kw_process_env, kw_g)
+  
+  dunn_g <- df_g %>%
+    dunn_test(Env_distance ~ process, p.adjust.method = "BH") %>%
+    mutate(Group = g)
+  dunn_process_env <- rbind(dunn_process_env, dunn_g)
+}
+
+if (nrow(kw_process_env) > 0) {
+  kw_process_env$P_adj <- p.adjust(kw_process_env$p, method = "BH")
+}
+write.csv(kw_process_env,
+          paste0(out_prefix, "_Kruskal_environmental_distance_among_processes_by_group.csv"), row.names = FALSE)
+write.csv(dunn_process_env,
+          paste0(out_prefix, "_Dunn_environmental_distance_among_processes_by_group.csv"), row.names = FALSE)
+
+# ============================================================
+# Part IX. Kruskal-Wallis: Each environmental factor difference among processes
+# ============================================================
+diff_long <- assembly_within_group %>%
+  select(Group, process, all_of(diff_cols)) %>%
+  pivot_longer(cols = all_of(diff_cols),
+               names_to = "Environmental_factor",
+               values_to = "Pairwise_difference") %>%
+  mutate(Environmental_factor = gsub("^diff_", "", Environmental_factor))
+
+kw_each_env_process <- data.frame()
+for (g in levels(diff_long$Group)) {
+  for (ef in unique(diff_long$Environmental_factor)) {
+    df_tmp <- diff_long %>% filter(Group == g, Environmental_factor == ef, !is.na(process))
+    if (length(unique(df_tmp$process)) < 2) next
+    kw_tmp <- df_tmp %>%
+      kruskal_test(Pairwise_difference ~ process) %>%
+      mutate(Group = g, Environmental_factor = ef)
+    kw_each_env_process <- rbind(kw_each_env_process, kw_tmp)
+  }
+}
+
+if (nrow(kw_each_env_process) > 0) {
+  kw_each_env_process <- kw_each_env_process %>%
+    group_by(Group) %>%
+    mutate(P_adj = p.adjust(p, method = "BH")) %>%
+    ungroup()
+}
+write.csv(kw_each_env_process,
+          paste0(out_prefix, "_Kruskal_each_environmental_factor_among_processes_by_group.csv"), row.names = FALSE)
+
+# ============================================================
+# Part X. Logistic regression: Env_distance predicting deterministic assembly by group
+# ============================================================
+logistic_results <- data.frame()
+
+for (g in levels(assembly_within_group$Group)) {
+  df_g <- assembly_within_group %>% filter(Group == g)
+  df_g$Deterministic <- ifelse(df_g$Assembly_type == "Deterministic", 1, 0)
+  if (length(unique(df_g$Deterministic)) < 2) next
+  
+  glm_g <- glm(Deterministic ~ Env_distance, data = df_g, family = binomial)
+  glm_sum <- summary(glm_g)
+  logistic_results <- rbind(logistic_results,
+                            data.frame(Group = g,
+                                       Predictor = "Env_distance",
+                                       Estimate = glm_sum$coefficients["Env_distance", "Estimate"],
+                                       Std_error = glm_sum$coefficients["Env_distance", "Std. Error"],
+                                       Z_value = glm_sum$coefficients["Env_distance", "z value"],
+                                       P_value = glm_sum$coefficients["Env_distance", "Pr(>|z|)"]))
+}
+
+if (nrow(logistic_results) > 0) {
+  logistic_results$P_adj <- p.adjust(logistic_results$P_value, method = "BH")
+}
+write.csv(logistic_results,
+          paste0(out_prefix, "_Logistic_environmental_distance_predicting_deterministic_assembly_by_group.csv"),
+          row.names = FALSE)
+
+# ============================================================
+# Part XI. Visualizations
+# ============================================================
+# 1. Environmental distance vs |bNTI|
+p_env_bnti <- ggplot(assembly_within_group, aes(x = Env_distance, y = abs_bNTI)) +
+  geom_point(alpha = 0.35, size = 1.5) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+  facet_wrap(~ Group, scales = "free") +
+  labs(x = "Pairwise environmental distance", y = "|βNTI|",
+       title = "Environmental distance versus |βNTI|") +
+  theme_bw(base_size = 13) +
+  theme(panel.grid = element_blank(), plot.title = element_text(hjust = 0.5, face = "bold"))
+ggsave(paste0(out_prefix, "_Environmental_distance_vs_abs_bNTI_by_group.pdf"), p_env_bnti, width = 8, height = 4.8)
+ggsave(paste0(out_prefix, "_Environmental_distance_vs_abs_bNTI_by_group.png"), p_env_bnti, width = 8, height = 4.8, dpi = 600)
+
+# 2. Environmental distance among assembly processes
+p_env_process <- ggplot(assembly_within_group, aes(x = process, y = Env_distance, fill = process)) +
+  geom_boxplot(outlier.shape = NA, width = 0.65) +
+  geom_jitter(width = 0.18, alpha = 0.25, size = 0.8) +
+  facet_wrap(~ Group, scales = "free_y") +
+  labs(x = "Assembly process", y = "Pairwise environmental distance",
+       title = "Environmental distance among assembly processes") +
+  theme_bw(base_size = 13) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 40, hjust = 1),
+        legend.position = "none",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+ggsave(paste0(out_prefix, "_Environmental_distance_among_assembly_processes_by_group.pdf"), p_env_process, width = 9, height = 5)
+ggsave(paste0(out_prefix, "_Environmental_distance_among_assembly_processes_by_group.png"), p_env_process, width = 9, height = 5, dpi = 600)
+
+# 3. Each environmental factor difference among processes
+p_each_env_process <- ggplot(diff_long, aes(x = process, y = Pairwise_difference, fill = process)) +
+  geom_boxplot(outlier.shape = NA, width = 0.65) +
+  facet_grid(Environmental_factor ~ Group, scales = "free_y") +
+  labs(x = "Assembly process", y = "Pairwise environmental difference",
+       title = "Environmental differences across assembly processes") +
+  theme_bw(base_size = 10) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none",
+        strip.text = element_text(face = "bold"),
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+ggsave(paste0(out_prefix, "_Each_environmental_factor_difference_among_processes_by_group.pdf"), p_each_env_process, width = 12, height = 12)
+ggsave(paste0(out_prefix, "_Each_environmental_factor_difference_among_processes_by_group.png"), p_each_env_process, width = 12, height = 12, dpi = 600)
+
+# 4. Assembly process percentage by group
+process_percent <- assembly_within_group %>%
+  group_by(Group, process) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  group_by(Group) %>%
+  mutate(Percentage = Count / sum(Count) * 100) %>%
+  ungroup()
+
+process_colors <- c(
+  "Homogeneous.Selection" = "#87BBD6",
+  "Undominated" = "#F6D7C4",
+  "Heterogeneous.Selection" = "#0563A1",
+  "Dispersal.Limitation" = "#E49E7F",
+  "Homogenizing.Dispersal" = "#BD1A24"
+)
+
+p_process_percent <- ggplot(process_percent, aes(x = Group, y = Percentage, fill = process)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.65) +
+  scale_fill_manual(values = process_colors, na.value = "grey70") +
+  labs(x = "Health state", y = "Ecological processes (%)", fill = "Assembly process") +
+  theme_bw(base_size = 13) +
+  theme(panel.grid = element_blank(), axis.text = element_text(color = "black"))
+ggsave(paste0(out_prefix, "_Assembly_process_percentage_by_group.pdf"), p_process_percent, width = 5.5, height = 4.5)
+ggsave(paste0(out_prefix, "_Assembly_process_percentage_by_group.png"), p_process_percent, width = 5.5, height = 4.5, dpi = 600)
+
+# ============================================================
+# Additional linear regression and Spearman for Env_distance vs abs_bNTI
+# ============================================================
+lm_env_bnti_results <- assembly_within_group %>%
+  group_by(Group) %>%
+  group_modify(~ {
+    model <- lm(abs_bNTI ~ Env_distance, data = .x)
+    sm <- summary(model)
+    data.frame(
+      n_pairwise = nrow(.x),
+      intercept = coef(model)[1],
+      slope = coef(model)[2],
+      R2 = sm$r.squared,
+      Adj_R2 = sm$adj.r.squared,
+      P_value = coef(sm)["Env_distance", "Pr(>|t|)"]
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    P_adj = p.adjust(P_value, method = "BH"),
+    Trend = case_when(
+      slope > 0 & P_value < 0.05 ~ "Significant positive",
+      slope < 0 & P_value < 0.05 ~ "Significant negative",
+      slope > 0 & P_value >= 0.05 ~ "Weak positive",
+      slope < 0 & P_value >= 0.05 ~ "Weak negative",
+      TRUE ~ "No clear trend"
+    )
+  )
+write.csv(lm_env_bnti_results,
+          paste0(out_prefix, "_LM_environmental_distance_vs_abs_bNTI_by_group.csv"), row.names = FALSE)
+
+spearman_env_bnti_results <- assembly_within_group %>%
+  group_by(Group) %>%
+  group_modify(~ {
+    test <- cor.test(.x$Env_distance, .x$abs_bNTI, method = "spearman", exact = FALSE)
+    data.frame(
+      n_pairwise = nrow(.x),
+      Spearman_rho = test$estimate,
+      P_value = test$p.value
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    P_adj = p.adjust(P_value, method = "BH"),
+    Trend = case_when(
+      Spearman_rho > 0 & P_value < 0.05 ~ "Significant positive",
+      Spearman_rho < 0 & P_value < 0.05 ~ "Significant negative",
+      Spearman_rho > 0 & P_value >= 0.05 ~ "Weak positive",
+      Spearman_rho < 0 & P_value >= 0.05 ~ "Weak negative",
+      TRUE ~ "No clear trend"
+    )
+  )
+write.csv(spearman_env_bnti_results,
+          paste0(out_prefix, "_Spearman_environmental_distance_vs_abs_bNTI_by_group.csv"), row.names = FALSE)
+
+cat("\nAll analyses completed.\n")

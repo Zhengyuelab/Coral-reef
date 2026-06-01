@@ -1,0 +1,1113 @@
+# ============================================================
+# RF Top100 ASV screening + health-state bias + AUC validation
+# 修正版：解决 select() 函数冲突问题
+# ============================================================
+
+# -----------------------------
+# 0. Packages
+# -----------------------------
+
+packages <- c(
+  "tidyverse",
+  "ranger",
+  "caret",
+  "pROC",
+  "parallel",
+  "ggplot2"
+)
+
+for (pkg in packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(ranger)
+  library(caret)
+  library(pROC)
+  library(parallel)
+  library(ggplot2)
+})
+
+set.seed(123)
+
+# -----------------------------
+# 1. Parameters
+# -----------------------------
+
+setwd("/code/Random forest/Data")
+
+asv_file  <- "asv_sampling.csv"
+meta_file <- "sample_sampling.csv"
+tax_file  <- "tax_table.csv"
+
+health_levels <- c("Good", "Moderate", "Poor")
+
+min_presence_samples <- 2
+min_total_count <- 500
+transform_method <- "log_cpm"   # "log_cpm", "hellinger", "binary"
+remove_nzv <- FALSE
+
+B <- 500
+num_trees <- 2000
+top_n_each_pair <- 100
+top_n_final <- 100
+
+mtry_mode <- "sqrt"             # "sqrt" or "factor"
+mtry_factor <- 0.10
+
+splitrule_use <- "extratrees"
+min_node_size_use <- 1
+sample_fraction_use <- 0.80
+
+w_selection  <- 0.45
+w_importance <- 0.30
+w_rank       <- 0.25
+
+w_max_score  <- 0.65
+w_mean_score <- 0.35
+
+alpha_stat <- 0.05
+
+cv_number <- 5
+cv_repeats <- 20
+auc_num_trees <- 2000
+
+# -----------------------------
+# 2. Utility functions
+# -----------------------------
+
+scale01 <- function(x) {
+  if (all(is.na(x))) return(rep(0, length(x)))
+  xmin <- min(x, na.rm = TRUE)
+  xmax <- max(x, na.rm = TRUE)
+  if (xmax == xmin) return(rep(0, length(x)))
+  (x - xmin) / (xmax - xmin)
+}
+
+get_mtry_value <- function(p, mtry_mode = "sqrt", mtry_factor = 0.10) {
+  if (mtry_mode == "sqrt") {
+    mtry_value <- round(sqrt(p))
+  } else if (mtry_mode == "factor") {
+    mtry_value <- round(p * mtry_factor)
+  } else {
+    stop("mtry_mode must be 'sqrt' or 'factor'.")
+  }
+  max(1, min(mtry_value, p))
+}
+
+get_n_threads <- function() {
+  cores <- parallel::detectCores()
+  if (is.na(cores)) cores <- 2
+  max(1, cores - 1)
+}
+
+# -----------------------------
+# 3. Read and match data
+# -----------------------------
+
+asv_table <- read.csv(asv_file, row.names = 1, check.names = FALSE)
+meta_data <- read.csv(meta_file, row.names = 1, check.names = FALSE)
+
+if (!file.exists(tax_file)) {
+  warning("tax_table.csv was not found. Taxonomy columns will be omitted.")
+  tax_table <- data.frame(row.names = rownames(asv_table))
+} else {
+  tax_table <- read.csv(tax_file, row.names = 1, check.names = FALSE)
+}
+
+common_samples <- intersect(colnames(asv_table), rownames(meta_data))
+
+if (length(common_samples) == 0) {
+  stop("No matched sample IDs between ASV table columns and metadata row names.")
+}
+
+asv_table <- asv_table[, common_samples, drop = FALSE]
+meta_data <- meta_data[common_samples, , drop = FALSE]
+
+if (!all(colnames(asv_table) == rownames(meta_data))) {
+  stop("Sample order mismatch after matching.")
+}
+
+if (!"Group" %in% colnames(meta_data)) {
+  stop("sample_sampling.csv must contain a column named 'Group'.")
+}
+
+meta_data$Group <- factor(meta_data$Group, levels = health_levels)
+
+if (any(is.na(meta_data$Group))) {
+  stop("Group must only contain: Good, Moderate, Poor.")
+}
+
+cat("\nSample distribution:\n")
+print(table(meta_data$Group))
+
+asv_mat_raw <- as.matrix(asv_table)
+mode(asv_mat_raw) <- "numeric"
+
+cat("\nRaw ASV number:", nrow(asv_mat_raw), "\n")
+cat("Sample number:", ncol(asv_mat_raw), "\n")
+
+# -----------------------------
+# 4. Preprocess ASV table
+# -----------------------------
+
+preprocess_asv <- function(asv_mat,
+                           meta_data,
+                           min_presence_samples,
+                           min_total_count,
+                           transform_method,
+                           remove_nzv) {
+  
+  asv_mat <- asv_mat[rowSums(asv_mat, na.rm = TRUE) > 0, , drop = FALSE]
+  
+  presence_n <- rowSums(asv_mat > 0, na.rm = TRUE)
+  total_count <- rowSums(asv_mat, na.rm = TRUE)
+  
+  keep <- presence_n >= min_presence_samples & total_count >= min_total_count
+  asv_filt <- asv_mat[keep, , drop = FALSE]
+  
+  cat("\nFiltered ASV number:", nrow(asv_filt), "\n")
+  cat("Filtering: presence >=", min_presence_samples,
+      "; total count >=", min_total_count, "\n")
+  
+  sample_depth <- colSums(asv_filt, na.rm = TRUE)
+  if (any(sample_depth == 0)) stop("Some samples have zero total reads after filtering.")
+  
+  if (transform_method == "log_cpm") {
+    asv_cpm <- sweep(asv_filt, 2, sample_depth, FUN = "/") * 1e6
+    asv_trans <- log10(asv_cpm + 1)
+  } else if (transform_method == "hellinger") {
+    asv_rel <- sweep(asv_filt, 2, sample_depth, FUN = "/")
+    asv_rel[is.na(asv_rel)] <- 0
+    asv_trans <- sqrt(asv_rel)
+  } else if (transform_method == "binary") {
+    asv_trans <- ifelse(asv_filt > 0, 1, 0)
+  } else {
+    stop("transform_method must be log_cpm, hellinger, or binary.")
+  }
+  
+  rf_x <- as.data.frame(t(asv_trans), check.names = FALSE)
+  rf_x$Group <- meta_data$Group
+  
+  feature_names <- setdiff(colnames(rf_x), "Group")
+  
+  if (remove_nzv) {
+    nzv_idx <- caret::nearZeroVar(rf_x[, feature_names, drop = FALSE])
+    if (length(nzv_idx) > 0) {
+      nzv_features <- feature_names[nzv_idx]
+      rf_x <- rf_x[, setdiff(colnames(rf_x), nzv_features), drop = FALSE]
+      cat("nearZeroVar removed ASVs:", length(nzv_features), "\n")
+    }
+  } else {
+    cat("nearZeroVar filtering skipped.\n")
+  }
+  
+  feature_names <- setdiff(colnames(rf_x), "Group")
+  asv_trans <- asv_trans[feature_names, , drop = FALSE]
+  asv_filt <- asv_filt[feature_names, , drop = FALSE]
+  
+  list(
+    rf_data = rf_x,
+    feature_names = feature_names,
+    asv_trans = asv_trans,
+    asv_filt = asv_filt
+  )
+}
+
+prep <- preprocess_asv(
+  asv_mat = asv_mat_raw,
+  meta_data = meta_data,
+  min_presence_samples = min_presence_samples,
+  min_total_count = min_total_count,
+  transform_method = transform_method,
+  remove_nzv = remove_nzv
+)
+
+rf_data <- prep$rf_data
+feature_names <- prep$feature_names
+asv_filt <- prep$asv_filt
+
+cat("\nFinal ASVs entering RF:", length(feature_names), "\n")
+
+# -----------------------------
+# 5. Pairwise Random Forest
+# -----------------------------
+
+run_pairwise_rf <- function(rf_data,
+                            feature_names,
+                            group_a,
+                            group_b,
+                            comparison_name) {
+  
+  cat("\n============================================================\n")
+  cat("Running pairwise RF:", comparison_name, "\n")
+  cat("============================================================\n")
+  
+  # 关键修正：显式调用 dplyr::filter 和 dplyr::select
+  pair_data <- rf_data %>%
+    dplyr::filter(Group %in% c(group_a, group_b)) %>%
+    dplyr::select(dplyr::all_of(feature_names), Group)
+  
+  pair_data$Group <- droplevels(pair_data$Group)
+  y_pair <- pair_data$Group
+  
+  print(table(y_pair))
+  
+  p <- length(feature_names)
+  mtry_value <- get_mtry_value(p, mtry_mode, mtry_factor)
+  
+  class_tab <- table(y_pair)
+  class_weights <- as.numeric(sum(class_tab) / (length(class_tab) * class_tab))
+  names(class_weights) <- names(class_tab)
+  
+  n_threads <- get_n_threads()
+  
+  rf_full <- ranger::ranger(
+    dependent.variable.name = "Group",
+    data = pair_data,
+    classification = TRUE,
+    num.trees = num_trees,
+    mtry = mtry_value,
+    splitrule = splitrule_use,
+    min.node.size = min_node_size_use,
+    sample.fraction = sample_fraction_use,
+    importance = "permutation",
+    class.weights = class_weights,
+    seed = 123,
+    num.threads = n_threads
+  )
+  
+  full_imp <- rf_full$variable.importance[feature_names]
+  full_imp[is.na(full_imp)] <- 0
+  full_rank <- rank(-full_imp, ties.method = "average")
+  
+  selection_count <- setNames(rep(0, p), feature_names)
+  importance_sum <- setNames(rep(0, p), feature_names)
+  rank_sum <- setNames(rep(0, p), feature_names)
+  
+  for (i in seq_len(B)) {
+    
+    set.seed(10000 + i)
+    
+    train_id <- caret::createDataPartition(y_pair, p = 0.80, list = FALSE)
+    train_data <- pair_data[train_id, , drop = FALSE]
+    
+    rf_i <- ranger::ranger(
+      dependent.variable.name = "Group",
+      data = train_data,
+      classification = TRUE,
+      num.trees = num_trees,
+      mtry = mtry_value,
+      splitrule = splitrule_use,
+      min.node.size = min_node_size_use,
+      sample.fraction = sample_fraction_use,
+      importance = "permutation",
+      class.weights = class_weights,
+      seed = 10000 + i,
+      num.threads = n_threads
+    )
+    
+    imp_i <- rf_i$variable.importance[feature_names]
+    imp_i[is.na(imp_i)] <- 0
+    
+    rank_i <- rank(-imp_i, ties.method = "average")
+    top_i <- names(sort(imp_i, decreasing = TRUE))[seq_len(min(top_n_each_pair, p))]
+    
+    selection_count[top_i] <- selection_count[top_i] + 1
+    importance_sum <- importance_sum + imp_i
+    rank_sum <- rank_sum + rank_i
+    
+    if (i %% 50 == 0) {
+      cat(comparison_name, "iteration", i, "/", B, "\n")
+    }
+  }
+  
+  score_df <- tibble::tibble(
+    ASV_ID = feature_names,
+    Comparison = comparison_name,
+    Selection_count = as.numeric(selection_count),
+    Selection_frequency = Selection_count / B,
+    Mean_importance = as.numeric(importance_sum) / B,
+    Mean_rank = as.numeric(rank_sum) / B,
+    Full_model_importance = as.numeric(full_imp),
+    Full_model_rank = as.numeric(full_rank),
+    OOB_accuracy = 1 - rf_full$prediction.error,
+    Mtry_value = mtry_value
+  ) %>%
+    dplyr::mutate(
+      Score_selection = scale01(Selection_frequency),
+      Score_importance = scale01(Mean_importance),
+      Score_rank = 1 - scale01(Mean_rank),
+      RF_pair_score = w_selection * Score_selection +
+        w_importance * Score_importance +
+        w_rank * Score_rank
+    ) %>%
+    dplyr::arrange(desc(RF_pair_score), desc(Selection_frequency), desc(Mean_importance))
+  
+  summary_df <- tibble::tibble(
+    Comparison = comparison_name,
+    Group_A = group_a,
+    Group_B = group_b,
+    Sample_n = nrow(pair_data),
+    ASV_n = p,
+    OOB_accuracy = 1 - rf_full$prediction.error,
+    Mtry_value = mtry_value,
+    B = B,
+    Num_trees = num_trees
+  )
+  
+  write.csv(score_df, paste0("RF_pairwise_", comparison_name, "_scores.csv"), row.names = FALSE)
+  
+  list(scores = score_df, summary = summary_df)
+}
+
+rf_gm <- run_pairwise_rf(rf_data, feature_names, "Good", "Moderate", "Good_vs_Moderate")
+rf_gp <- run_pairwise_rf(rf_data, feature_names, "Good", "Poor", "Good_vs_Poor")
+rf_mp <- run_pairwise_rf(rf_data, feature_names, "Moderate", "Poor", "Moderate_vs_Poor")
+
+pairwise_summary <- dplyr::bind_rows(rf_gm$summary, rf_gp$summary, rf_mp$summary)
+write.csv(pairwise_summary, "RF_pairwise_model_summary.csv", row.names = FALSE)
+
+# -----------------------------
+# 6. Combine pairwise RF scores and extract Top100
+# -----------------------------
+
+all_pair_scores <- dplyr::bind_rows(rf_gm$scores, rf_gp$scores, rf_mp$scores)
+
+write.csv(
+  all_pair_scores,
+  "RF_all_pairwise_ASV_scores_long.csv",
+  row.names = FALSE
+)
+
+rf_combined <- all_pair_scores %>%
+  dplyr::group_by(ASV_ID) %>%
+  dplyr::summarise(
+    RF_score_max = max(RF_pair_score, na.rm = TRUE),
+    RF_score_mean = mean(RF_pair_score, na.rm = TRUE),
+    RF_score_combined = w_max_score * RF_score_max + w_mean_score * RF_score_mean,
+    Best_comparison = Comparison[which.max(RF_pair_score)],
+    Max_selection_frequency = max(Selection_frequency, na.rm = TRUE),
+    Mean_selection_frequency = mean(Selection_frequency, na.rm = TRUE),
+    Max_importance = max(Mean_importance, na.rm = TRUE),
+    Mean_importance = mean(Mean_importance, na.rm = TRUE),
+    Best_mean_rank = min(Mean_rank, na.rm = TRUE),
+    Mean_rank = mean(Mean_rank, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(desc(RF_score_combined), desc(Max_selection_frequency), desc(Max_importance)) %>%
+  dplyr::mutate(RF_global_rank = dplyr::row_number())
+
+tax_df <- tax_table %>%
+  tibble::rownames_to_column("ASV_ID")
+
+rf_combined_tax <- rf_combined %>%
+  dplyr::left_join(tax_df, by = "ASV_ID")
+
+write.csv(
+  rf_combined_tax,
+  "RF_pairwise_combined_all_ASV_scores.csv",
+  row.names = FALSE
+)
+
+rf_top100 <- rf_combined_tax %>%
+  dplyr::slice_head(n = top_n_final)
+
+write.csv(
+  rf_top100,
+  "RF_top100_ASVs_by_RF_score.csv",
+  row.names = FALSE
+)
+
+cat("\nRF Top100 ASVs:\n")
+print(rf_top100$ASV_ID)
+
+# -----------------------------
+# 7. Health-state bias analysis for Top100 ASVs
+# -----------------------------
+
+get_bias_direction <- function(med_good, med_moderate, med_poor,
+                               mean_good, mean_moderate, mean_poor) {
+  
+  med_vec <- c(Good = med_good, Moderate = med_moderate, Poor = med_poor)
+  mean_vec <- c(Good = mean_good, Moderate = mean_moderate, Poor = mean_poor)
+  
+  max_med <- max(med_vec, na.rm = TRUE)
+  med_winners <- names(med_vec)[abs(med_vec - max_med) <= 1e-12]
+  
+  if (length(med_winners) == 1) {
+    return(tibble::tibble(
+      Biased_health_state = med_winners,
+      Direction_basis = "Highest_median_transformed_abundance"
+    ))
+  }
+  
+  max_mean <- max(mean_vec, na.rm = TRUE)
+  mean_winners <- names(mean_vec)[abs(mean_vec - max_mean) <= 1e-12]
+  
+  if (length(mean_winners) == 1) {
+    return(tibble::tibble(
+      Biased_health_state = mean_winners,
+      Direction_basis = "Highest_mean_due_to_median_tie"
+    ))
+  }
+  
+  tibble::tibble(
+    Biased_health_state = "Ambiguous_tie",
+    Direction_basis = "Median_and_mean_tie"
+  )
+}
+
+analyze_top100_bias <- function(rf_data, rf_top100, alpha_stat = 0.05) {
+  
+  top_ids <- rf_top100$ASV_ID
+  
+  abundance_long <- rf_data %>%
+    dplyr::select(dplyr::all_of(top_ids), Group) %>%
+    tibble::rownames_to_column("SampleID") %>%
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(top_ids),
+      names_to = "ASV_ID",
+      values_to = "Transformed_abundance"
+    ) %>%
+    dplyr::mutate(Group = factor(Group, levels = health_levels))
+  
+  write.csv(
+    abundance_long,
+    "RF_top100_transformed_abundance_long.csv",
+    row.names = FALSE
+  )
+  
+  abundance_summary <- abundance_long %>%
+    dplyr::group_by(ASV_ID, Group) %>%
+    dplyr::summarise(
+      n_samples = dplyr::n(),
+      n_present = sum(Transformed_abundance > 0, na.rm = TRUE),
+      prevalence_ratio = mean(Transformed_abundance > 0, na.rm = TRUE),
+      mean_transformed = mean(Transformed_abundance, na.rm = TRUE),
+      median_transformed = median(Transformed_abundance, na.rm = TRUE),
+      sd_transformed = sd(Transformed_abundance, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    tidyr::pivot_wider(
+      names_from = Group,
+      values_from = c(
+        n_samples,
+        n_present,
+        prevalence_ratio,
+        mean_transformed,
+        median_transformed,
+        sd_transformed
+      ),
+      names_glue = "{.value}_{Group}"
+    )
+  
+  direction_df <- purrr::pmap_dfr(
+    list(
+      abundance_summary$median_transformed_Good,
+      abundance_summary$median_transformed_Moderate,
+      abundance_summary$median_transformed_Poor,
+      abundance_summary$mean_transformed_Good,
+      abundance_summary$mean_transformed_Moderate,
+      abundance_summary$mean_transformed_Poor
+    ),
+    get_bias_direction
+  ) %>%
+    dplyr::mutate(ASV_ID = abundance_summary$ASV_ID, .before = 1)
+  
+  kruskal_df <- abundance_long %>%
+    dplyr::group_by(ASV_ID) %>%
+    dplyr::summarise(
+      Kruskal_p = if (length(unique(Transformed_abundance)) <= 1) {
+        NA_real_
+      } else {
+        tryCatch(
+          kruskal.test(Transformed_abundance ~ Group)$p.value,
+          error = function(e) NA_real_
+        )
+      },
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(Kruskal_q_BH_top100 = p.adjust(Kruskal_p, method = "BH"))
+  
+  write.csv(
+    kruskal_df,
+    "RF_top100_kruskal_test_results.csv",
+    row.names = FALSE
+  )
+  
+  pair_defs <- t(combn(health_levels, 2))
+  
+  pairwise_df <- purrr::map_dfr(top_ids, function(asv) {
+    
+    sub_df <- abundance_long %>% dplyr::filter(ASV_ID == asv)
+    
+    purrr::map_dfr(seq_len(nrow(pair_defs)), function(i) {
+      
+      g1 <- pair_defs[i, 1]
+      g2 <- pair_defs[i, 2]
+      
+      x1 <- sub_df$Transformed_abundance[sub_df$Group == g1]
+      x2 <- sub_df$Transformed_abundance[sub_df$Group == g2]
+      
+      med1 <- median(x1, na.rm = TRUE)
+      med2 <- median(x2, na.rm = TRUE)
+      
+      p_value <- if (length(unique(c(x1, x2))) <= 1) {
+        NA_real_
+      } else {
+        tryCatch(
+          wilcox.test(x1, x2, exact = FALSE)$p.value,
+          error = function(e) NA_real_
+        )
+      }
+      
+      tibble::tibble(
+        ASV_ID = asv,
+        Comparison = paste(g1, g2, sep = "_vs_"),
+        Group1 = g1,
+        Group2 = g2,
+        Median_group1 = med1,
+        Median_group2 = med2,
+        Median_diff_group1_minus_group2 = med1 - med2,
+        Pairwise_p = p_value
+      )
+    })
+  }) %>%
+    dplyr::mutate(Pairwise_q_BH_global = p.adjust(Pairwise_p, method = "BH")) %>%
+    dplyr::group_by(ASV_ID) %>%
+    dplyr::mutate(Pairwise_q_BH_within_ASV = p.adjust(Pairwise_p, method = "BH")) %>%
+    dplyr::ungroup()
+  
+  write.csv(
+    pairwise_df,
+    "RF_top100_pairwise_wilcoxon_results_long.csv",
+    row.names = FALSE
+  )
+  
+  get_support <- function(asv, bias_state, kruskal_q) {
+    
+    if (!(bias_state %in% health_levels)) {
+      return(tibble::tibble(
+        ASV_ID = asv,
+        Bias_support = "Ambiguous_tie_no_unique_bias",
+        Significant_pairwise_support_n = NA_integer_
+      ))
+    }
+    
+    other_groups <- setdiff(health_levels, bias_state)
+    
+    tmp <- purrr::map_dfr(other_groups, function(other) {
+      
+      row <- pairwise_df %>%
+        dplyr::filter(
+          ASV_ID == asv,
+          (Group1 == bias_state & Group2 == other) |
+            (Group1 == other & Group2 == bias_state)
+        )
+      
+      if (nrow(row) == 0) {
+        return(tibble::tibble(
+          Other_group = other,
+          Bias_minus_other_median_diff = NA_real_,
+          Pairwise_q_BH_global = NA_real_
+        ))
+      }
+      
+      diff_value <- if (row$Group1[1] == bias_state) {
+        row$Median_diff_group1_minus_group2[1]
+      } else {
+        -row$Median_diff_group1_minus_group2[1]
+      }
+      
+      tibble::tibble(
+        Other_group = other,
+        Bias_minus_other_median_diff = diff_value,
+        Pairwise_q_BH_global = row$Pairwise_q_BH_global[1]
+      )
+    })
+    
+    sig_n <- sum(
+      !is.na(tmp$Pairwise_q_BH_global) &
+        tmp$Pairwise_q_BH_global < alpha_stat &
+        tmp$Bias_minus_other_median_diff > 0
+    )
+    
+    support <- dplyr::case_when(
+      is.na(kruskal_q) ~ "Not_tested",
+      kruskal_q < alpha_stat & sig_n == 2 ~ "Strong_statistical_support",
+      kruskal_q < alpha_stat & sig_n == 1 ~ "Partial_statistical_support",
+      kruskal_q < alpha_stat & sig_n == 0 ~ "Kruskal_significant_but_pairwise_not_supported",
+      TRUE ~ "Descriptive_abundance_trend_only"
+    )
+    
+    tibble::tibble(
+      ASV_ID = asv,
+      Bias_support = support,
+      Significant_pairwise_support_n = sig_n,
+      Bias_vs_other1 = tmp$Other_group[1],
+      Bias_vs_other1_median_diff = tmp$Bias_minus_other_median_diff[1],
+      Bias_vs_other1_q_global = tmp$Pairwise_q_BH_global[1],
+      Bias_vs_other2 = tmp$Other_group[2],
+      Bias_vs_other2_median_diff = tmp$Bias_minus_other_median_diff[2],
+      Bias_vs_other2_q_global = tmp$Pairwise_q_BH_global[2]
+    )
+  }
+  
+  support_df <- direction_df %>%
+    dplyr::left_join(kruskal_df, by = "ASV_ID") %>%
+    purrr::pmap_dfr(function(ASV_ID,
+                             Biased_health_state,
+                             Direction_basis,
+                             Kruskal_p,
+                             Kruskal_q_BH_top100) {
+      get_support(ASV_ID, Biased_health_state, Kruskal_q_BH_top100)
+    })
+  
+  pairwise_wide <- pairwise_df %>%
+    dplyr::select(
+      ASV_ID,
+      Comparison,
+      Pairwise_p,
+      Pairwise_q_BH_global,
+      Pairwise_q_BH_within_ASV,
+      Median_diff_group1_minus_group2
+    ) %>%
+    tidyr::pivot_wider(
+      names_from = Comparison,
+      values_from = c(
+        Pairwise_p,
+        Pairwise_q_BH_global,
+        Pairwise_q_BH_within_ASV,
+        Median_diff_group1_minus_group2
+      )
+    )
+  
+  final_df <- rf_top100 %>%
+    dplyr::left_join(direction_df, by = "ASV_ID") %>%
+    dplyr::left_join(support_df, by = "ASV_ID") %>%
+    dplyr::left_join(kruskal_df, by = "ASV_ID") %>%
+    dplyr::left_join(abundance_summary, by = "ASV_ID") %>%
+    dplyr::left_join(pairwise_wide, by = "ASV_ID")
+  
+  first_cols <- c(
+    "RF_global_rank",
+    "ASV_ID",
+    "Biased_health_state",
+    "Bias_support",
+    "Direction_basis",
+    "Significant_pairwise_support_n",
+    "RF_score_combined",
+    "RF_score_max",
+    "RF_score_mean",
+    "Best_comparison",
+    "Max_selection_frequency",
+    "Mean_selection_frequency",
+    "Max_importance",
+    "Mean_importance",
+    "Best_mean_rank",
+    "Mean_rank",
+    "Kruskal_p",
+    "Kruskal_q_BH_top100"
+  )
+  
+  final_df <- final_df[, c(intersect(first_cols, colnames(final_df)),
+                           setdiff(colnames(final_df), first_cols))]
+  
+  write.csv(
+    final_df,
+    "RF_top100_ASV_health_state_bias.csv",
+    row.names = FALSE
+  )
+  
+  final_df
+}
+
+top100_bias_result <- analyze_top100_bias(
+  rf_data = rf_data,
+  rf_top100 = rf_top100,
+  alpha_stat = alpha_stat
+)
+
+cat("\nTop100 health-state bias result:\n")
+print(
+  top100_bias_result %>%
+    dplyr::select(
+      RF_global_rank,
+      ASV_ID,
+      Biased_health_state,
+      Bias_support,
+      RF_score_combined,
+      Kruskal_q_BH_top100
+    )
+)
+
+# -----------------------------
+# 8. AUC validation using RF Top100 ASVs
+# -----------------------------
+
+calculate_auc_from_caret <- function(model,
+                                     class_levels = c("Good", "Moderate", "Poor"),
+                                     output_prefix = "RF_top100_ASVs") {
+  
+  pred_df <- model$pred
+  best_tune <- model$bestTune
+  
+  for (param_name in colnames(best_tune)) {
+    if (param_name %in% colnames(pred_df)) {
+      pred_df <- pred_df[
+        pred_df[[param_name]] == best_tune[[param_name]][1],
+        ,
+        drop = FALSE
+      ]
+    }
+  }
+  
+  pred_df$obs <- factor(pred_df$obs, levels = class_levels)
+  pred_df$pred <- factor(pred_df$pred, levels = class_levels)
+  
+  write.csv(
+    pred_df,
+    paste0(output_prefix, "_CV_predictions.csv"),
+    row.names = FALSE
+  )
+  
+  auc_df <- purrr::map_dfr(class_levels, function(cls) {
+    
+    response_binary <- factor(
+      ifelse(pred_df$obs == cls, cls, paste0("Not_", cls)),
+      levels = c(paste0("Not_", cls), cls)
+    )
+    
+    roc_obj <- pROC::roc(
+      response = response_binary,
+      predictor = pred_df[[cls]],
+      levels = c(paste0("Not_", cls), cls),
+      direction = "<",
+      quiet = TRUE
+    )
+    
+    ci_obj <- tryCatch(
+      pROC::ci.auc(roc_obj),
+      error = function(e) c(NA, NA, NA)
+    )
+    
+    tibble::tibble(
+      Class = cls,
+      Comparison = paste0(cls, "_vs_rest"),
+      AUC = as.numeric(pROC::auc(roc_obj)),
+      CI_low = as.numeric(ci_obj[1]),
+      CI_mid = as.numeric(ci_obj[2]),
+      CI_high = as.numeric(ci_obj[3])
+    )
+  })
+  
+  macro_auc <- mean(auc_df$AUC, na.rm = TRUE)
+  
+  multiclass_auc <- tryCatch(
+    as.numeric(
+      pROC::multiclass.roc(
+        response = pred_df$obs,
+        predictor = as.matrix(pred_df[, class_levels]),
+        levels = class_levels
+      )$auc
+    ),
+    error = function(e) NA_real_
+  )
+  
+  auc_summary <- tibble::tibble(
+    Metric = c("Macro_average_one_vs_rest_AUC", "pROC_multiclass_AUC"),
+    Value = c(macro_auc, multiclass_auc)
+  )
+  
+  write.csv(
+    auc_df,
+    paste0(output_prefix, "_one_vs_rest_AUC.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    auc_summary,
+    paste0(output_prefix, "_AUC_summary.csv"),
+    row.names = FALSE
+  )
+  
+  roc_curve_df <- purrr::map_dfr(class_levels, function(cls) {
+    
+    response_binary <- factor(
+      ifelse(pred_df$obs == cls, cls, paste0("Not_", cls)),
+      levels = c(paste0("Not_", cls), cls)
+    )
+    
+    roc_obj <- pROC::roc(
+      response = response_binary,
+      predictor = pred_df[[cls]],
+      levels = c(paste0("Not_", cls), cls),
+      direction = "<",
+      quiet = TRUE
+    )
+    
+    tibble::tibble(
+      Class = cls,
+      Specificity = roc_obj$specificities,
+      Sensitivity = roc_obj$sensitivities,
+      FPR = 1 - roc_obj$specificities
+    )
+  })
+  
+  write.csv(
+    roc_curve_df,
+    paste0(output_prefix, "_ROC_curve_data.csv"),
+    row.names = FALSE
+  )
+  
+  p_roc <- ggplot(
+    roc_curve_df,
+    aes(x = FPR, y = Sensitivity, color = Class)
+  ) +
+    geom_line(linewidth = 1) +
+    geom_abline(
+      intercept = 0,
+      slope = 1,
+      linetype = "dashed",
+      color = "grey50"
+    ) +
+    coord_equal() +
+    theme_bw() +
+    labs(
+      x = "False positive rate",
+      y = "True positive rate",
+      title = "One-vs-rest ROC curves: RF Top100 ASVs",
+      color = "Class"
+    ) +
+    theme(panel.grid.minor = element_blank())
+  
+  ggsave(
+    paste0(output_prefix, "_ROC_curves.pdf"),
+    p_roc,
+    width = 5,
+    height = 5
+  )
+  
+  list(
+    auc_df = auc_df,
+    auc_summary = auc_summary,
+    pred_df = pred_df,
+    roc_curve_df = roc_curve_df
+  )
+}
+
+train_top100_auc <- function(rf_data, rf_top100) {
+  
+  top_ids <- rf_top100$ASV_ID
+  
+  x_top100 <- rf_data %>%
+    dplyr::select(dplyr::all_of(top_ids))
+  
+  y_top100 <- factor(rf_data$Group, levels = health_levels)
+  
+  mtry_values <- unique(round(c(
+    sqrt(ncol(x_top100)),
+    ncol(x_top100) * 0.05,
+    ncol(x_top100) * 0.10,
+    ncol(x_top100) * 0.20,
+    ncol(x_top100) * 0.30
+  )))
+  
+  mtry_values <- mtry_values[
+    mtry_values >= 1 & mtry_values <= ncol(x_top100)
+  ]
+  
+  tune_grid <- expand.grid(
+    mtry = mtry_values,
+    splitrule = c("gini", "extratrees"),
+    min.node.size = c(1, 3, 5)
+  )
+  
+  ctrl_auc <- caret::trainControl(
+    method = "repeatedcv",
+    number = cv_number,
+    repeats = cv_repeats,
+    classProbs = TRUE,
+    savePredictions = "final",
+    allowParallel = TRUE
+  )
+  
+  set.seed(123)
+  
+  model <- caret::train(
+    x = x_top100,
+    y = y_top100,
+    method = "ranger",
+    trControl = ctrl_auc,
+    tuneGrid = tune_grid,
+    metric = "Accuracy",
+    importance = "permutation",
+    num.trees = auc_num_trees
+  )
+  
+  print(model)
+  
+  best_perf <- model$results %>%
+    dplyr::filter(
+      mtry == model$bestTune$mtry,
+      splitrule == model$bestTune$splitrule,
+      min.node.size == model$bestTune$min.node.size
+    ) %>%
+    dplyr::mutate(Model = "RF_Top100_ASVs_multiclass_validation", .before = 1)
+  
+  write.csv(
+    best_perf,
+    "RF_top100_multiclass_validation_performance.csv",
+    row.names = FALSE
+  )
+  
+  pred_best <- model$pred
+  
+  for (param_name in colnames(model$bestTune)) {
+    if (param_name %in% colnames(pred_best)) {
+      pred_best <- pred_best[
+        pred_best[[param_name]] == model$bestTune[[param_name]][1],
+        ,
+        drop = FALSE
+      ]
+    }
+  }
+  
+  pred_best$obs <- factor(pred_best$obs, levels = health_levels)
+  pred_best$pred <- factor(pred_best$pred, levels = health_levels)
+  
+  cm <- caret::confusionMatrix(
+    data = pred_best$pred,
+    reference = pred_best$obs
+  )
+  
+  cat("\nConfusion matrix for RF Top100 ASVs:\n")
+  print(cm)
+  
+  write.csv(
+    as.data.frame(cm$table),
+    "RF_top100_confusion_matrix.csv",
+    row.names = FALSE
+  )
+  
+  cm_df <- as.data.frame(cm$table)
+  
+  p_cm <- ggplot(
+    cm_df,
+    aes(x = Prediction, y = Reference, fill = Freq)
+  ) +
+    geom_tile() +
+    geom_text(aes(label = Freq), size = 5) +
+    theme_bw() +
+    labs(
+      x = "Predicted group",
+      y = "Observed group",
+      title = "Multiclass validation using RF Top100 ASVs"
+    ) +
+    theme(panel.grid = element_blank())
+  
+  ggsave(
+    "RF_top100_multiclass_confusion_matrix.pdf",
+    p_cm,
+    width = 5,
+    height = 4
+  )
+  
+  auc_result <- calculate_auc_from_caret(
+    model = model,
+    class_levels = health_levels,
+    output_prefix = "RF_top100_ASVs"
+  )
+  
+  list(
+    model = model,
+    confusion_matrix = cm,
+    auc_result = auc_result
+  )
+}
+
+auc_top100 <- train_top100_auc(
+  rf_data = rf_data,
+  rf_top100 = rf_top100
+)
+
+# -----------------------------
+# 9. Simple summary plots
+# -----------------------------
+
+p_score <- top100_bias_result %>%
+  dplyr::mutate(
+    ASV_ID = factor(ASV_ID, levels = rev(ASV_ID)),
+    Biased_health_state = factor(
+      Biased_health_state,
+      levels = c("Good", "Moderate", "Poor", "Ambiguous_tie")
+    )
+  ) %>%
+  ggplot(aes(x = RF_score_combined, y = ASV_ID, fill = Biased_health_state)) +
+  geom_col(width = 0.75) +
+  theme_bw() +
+  labs(
+    x = "Pairwise RF composite score",
+    y = "ASV ID",
+    fill = "Biased health state",
+    title = "Top 100 ASVs selected by Random Forest"
+  ) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  "RF_top100_score_and_health_bias.pdf",
+  p_score,
+  width = 7,
+  height = 8
+)
+
+p_bias <- top100_bias_result %>%
+  dplyr::count(Biased_health_state, Bias_support) %>%
+  ggplot(aes(x = Biased_health_state, y = n, fill = Bias_support)) +
+  geom_col(width = 0.75) +
+  theme_bw() +
+  labs(
+    x = "Biased health state",
+    y = "Number of ASVs",
+    fill = "Statistical support",
+    title = "Health-state bias distribution of RF Top100 ASVs"
+  ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+
+ggsave(
+  "RF_top100_health_bias_distribution.pdf",
+  p_bias,
+  width = 7,
+  height = 4.5
+)
+
+# -----------------------------
+# 10. Final message
+# -----------------------------
+
+cat("\n============================================================\n")
+cat("Analysis finished successfully.\n\n")
+
+cat("Main outputs:\n")
+cat("1. RF_top100_ASVs_by_RF_score.csv\n")
+cat("2. RF_top100_ASV_health_state_bias.csv\n")
+cat("3. RF_top100_kruskal_test_results.csv\n")
+cat("4. RF_top100_pairwise_wilcoxon_results_long.csv\n")
+cat("5. RF_top100_ASVs_one_vs_rest_AUC.csv\n")
+cat("6. RF_top100_ASVs_AUC_summary.csv\n")
+cat("7. RF_top100_ASVs_ROC_curves.pdf\n")
+cat("8. RF_top100_multiclass_validation_performance.csv\n")
+cat("9. RF_top100_confusion_matrix.csv\n")
+cat("10. RF_top100_score_and_health_bias.pdf\n")
+cat("============================================================\n")
+
