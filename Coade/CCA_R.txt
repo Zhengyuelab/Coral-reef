@@ -1,0 +1,339 @@
+rm(list = ls())
+
+# ============================================================================
+# CCA & envfit Analysis on Relative Abundance (16S / 3 µm)
+# ============================================================================
+
+library(vegan)
+library(tidyverse)
+library(ggplot2)
+
+setwd("/code/CCA/Data")
+
+# ===============================
+# 1. 读取数据
+# ===============================
+otu_tax_raw <- read.csv("asv_analysis.csv",
+                        row.names = 1,
+                        check.names = FALSE)
+
+design <- read.csv("3Env.csv",
+                   check.names = FALSE,
+                   fileEncoding = "UTF-8-BOM")
+
+colnames(design) <- trimws(colnames(design))
+
+# ===============================
+# 2. 计算相对丰度（每个样本列和 = 1）
+# ===============================
+otu_tax_rel <- apply(otu_tax_raw, 2, function(x) {
+  if (sum(x) == 0) return(x)
+  x / sum(x)
+})
+
+otu_tax_rel <- as.data.frame(otu_tax_rel)
+
+write.csv(otu_tax_rel,
+          "ASV_relative_abundance.csv",
+          row.names = TRUE)
+
+# ===============================
+# 3. 对齐样本数量
+# ===============================
+sample_count <- min(ncol(otu_tax_rel), nrow(design))
+if (sample_count == 0) stop("样本数量为零，无法执行 CCA。")
+
+otu_tax_subset <- otu_tax_rel[, 1:sample_count, drop = FALSE]
+design_subset  <- design[1:sample_count, , drop = FALSE]
+
+# ===============================
+# 4. 识别样品 ID 列
+# ===============================
+if ("Sample" %in% colnames(design_subset)) {
+  sample_col <- "Sample"
+} else if ("SampleID" %in% colnames(design_subset)) {
+  sample_col <- "SampleID"
+} else {
+  sample_col <- colnames(design_subset)[1]
+  warning(paste0("未找到 Sample 或 SampleID 列，默认使用第一列作为样品列：", sample_col))
+}
+
+design_subset[[sample_col]] <- trimws(as.character(design_subset[[sample_col]]))
+
+# ===============================
+# 5. 指定异常值（可选）
+#    只将特定样品的特定环境因子设为 NA，不删除整个样品
+# ===============================
+# 若无异常值可保持为空 tribble：
+# abnormal_cells <- tribble(
+#   ~Sample, ~Factor
+# )
+
+# 若有异常值，请根据实际情况修改：
+abnormal_cells <- tribble(
+  ~Sample,   ~Factor,
+  "Sample1", "T",
+  "Sample2", "Salinity"
+)
+
+# ===============================
+# 6. 提取环境因子（数值型，排除非环境列及 Eh）
+# ===============================
+env_data <- design_subset
+sample_names <- env_data[[sample_col]]
+
+# 移除样品列
+env_data <- env_data[, !colnames(env_data) %in% sample_col, drop = FALSE]
+
+# 移除可能存在的分组列
+env_data <- env_data[, !colnames(env_data) %in% c("Group", "Health", "Zone"), drop = FALSE]
+
+# 保留数值型变量
+env_data <- env_data[, sapply(env_data, is.numeric), drop = FALSE]
+
+# 排除 Eh
+env_data <- env_data[, !colnames(env_data) %in% "Eh", drop = FALSE]
+
+if (ncol(env_data) == 0) {
+  stop("没有可用于 CCA 的数值型环境因子，请检查 3Env.csv。")
+}
+
+rownames(env_data) <- sample_names
+
+cat("Environmental factors used for CCA and envfit:\n")
+print(colnames(env_data))
+
+# ===============================
+# 7. 将指定异常值替换为 NA
+# ===============================
+if (nrow(abnormal_cells) > 0) {
+  for (i in seq_len(nrow(abnormal_cells))) {
+    sample_i <- abnormal_cells$Sample[i]
+    factor_i <- abnormal_cells$Factor[i]
+    
+    if (!sample_i %in% rownames(env_data)) {
+      warning(paste0("样品 ", sample_i, " 不存在，已跳过。"))
+      next
+    }
+    if (!factor_i %in% colnames(env_data)) {
+      warning(paste0("环境因子 ", factor_i, " 不存在，已跳过。"))
+      next
+    }
+    env_data[sample_i, factor_i] <- NA
+  }
+}
+
+write.csv(env_data,
+          "Environmental_factors_with_outliers_as_NA.csv",
+          row.names = TRUE)
+
+# ===============================
+# 8. 用中位数填补 NA
+# ===============================
+env_data_clean <- env_data
+
+for (j in seq_len(ncol(env_data_clean))) {
+  if (any(is.na(env_data_clean[, j]))) {
+    median_value <- median(env_data_clean[, j], na.rm = TRUE)
+    env_data_clean[is.na(env_data_clean[, j]), j] <- median_value
+  }
+}
+
+write.csv(env_data_clean,
+          "Environmental_factors_outliers_replaced_by_median.csv",
+          row.names = TRUE)
+
+cat("Final environmental variables used:\n")
+print(colnames(env_data_clean))
+
+# ===============================
+# 9. 执行 CCA（基于相对丰度）
+# ===============================
+cca_res <- cca(t(otu_tax_subset), env_data_clean, scale = TRUE)
+
+# 解释率
+cca1 <- round(cca_res$CCA$eig[1] / sum(cca_res$CCA$eig) * 100, 2)
+cca2 <- round(cca_res$CCA$eig[2] / sum(cca_res$CCA$eig) * 100, 2)
+
+# ===============================
+# 10. PDF 输出设置
+# ===============================
+pdf_width_cm  <- 18
+pdf_height_cm <- 14
+core_width_cm  <- 13.5
+core_height_cm <- 10.5
+
+pdf(file = "CCA_relative_abundance_black_points_outlier_removed_adjusted_size.pdf",
+    width  = pdf_width_cm  / 2.54,
+    height = pdf_height_cm / 2.54)
+
+par(mar = c(5.5, 5.5, 4.0, 4.5),
+    mgp = c(3.0, 0.9, 0),
+    las = 1,
+    xpd = FALSE)
+
+par(pin = c(core_width_cm / 2.54, core_height_cm / 2.54))
+
+# ===============================
+# 11. 计算箭头与坐标范围
+# ===============================
+bp <- scores(cca_res, display = "bp", scaling = "species")
+site_scores <- scores(cca_res, display = "sites", scaling = "species")
+
+if (nrow(bp) > 0) {
+  site_range_x <- range(site_scores[, 1], na.rm = TRUE)
+  site_range_y <- range(site_scores[, 2], na.rm = TRUE)
+  
+  scale_x <- max(abs(site_range_x)) / max(abs(bp[, 1])) * 1.15
+  scale_y <- max(abs(site_range_y)) / max(abs(bp[, 2])) * 1.15
+  arrow_scale <- min(scale_x, scale_y)
+  
+  arrow_x <- bp[, 1] * arrow_scale
+  arrow_y <- bp[, 2] * arrow_scale
+  
+  label_x <- arrow_x * 1.18
+  label_y <- arrow_y * 1.18
+  
+  x_all <- c(site_scores[, 1], arrow_x, label_x)
+  y_all <- c(site_scores[, 2], arrow_y, label_y)
+} else {
+  arrow_scale <- 1
+  arrow_x <- NULL
+  arrow_y <- NULL
+  label_x <- NULL
+  label_y <- NULL
+  
+  x_all <- site_scores[, 1]
+  y_all <- site_scores[, 2]
+}
+
+x_pad <- diff(range(x_all, na.rm = TRUE)) * 0.18
+y_pad <- diff(range(y_all, na.rm = TRUE)) * 0.18
+
+xlim_use <- range(x_all, na.rm = TRUE) + c(-x_pad, x_pad)
+ylim_use <- range(y_all, na.rm = TRUE) + c(-y_pad, y_pad)
+
+# ===============================
+# 12. 绘制 CCA 图
+# ===============================
+plot(cca_res,
+     type = "n",
+     scaling = "species",
+     xlim = xlim_use,
+     ylim = ylim_use,
+     xlab = paste0("CCA1 (", cca1, "%)"),
+     ylab = paste0("CCA2 (", cca2, "%)"),
+     cex.lab = 1.35,
+     cex.axis = 1.25,
+     bty = "o",
+     tcl = -0.3,
+     font.lab = 2)
+
+abline(h = 0, v = 0, lty = "dotted", col = "gray60")
+
+points(cca_res,
+       display = "sites",
+       scaling = "species",
+       pch = 21,
+       bg = "black",
+       cex = 1.25,
+       col = "black",
+       lwd = 1.0)
+
+if (nrow(bp) > 0) {
+  arrows(0, 0,
+         arrow_x,
+         arrow_y,
+         col = "#F1B656",
+         lwd = 1.5,
+         length = 0.12,
+         angle = 20)
+  
+  text(label_x,
+       label_y,
+       labels = rownames(bp),
+       col = "#F1B656",
+       cex = 1.05)
+}
+
+dev.off()
+
+# ============================================================
+# 13. envfit 显著性检验
+# ============================================================
+envfit_res <- envfit(cca_res,
+                     env_data_clean,
+                     permutations = 999)
+
+cor_com <- data.frame(
+  Factor  = names(envfit_res$vectors$r),
+  r2      = as.numeric(envfit_res$vectors$r),
+  p.value = as.numeric(envfit_res$vectors$pvals)
+)
+
+cor_com$significance <- cut(
+  cor_com$p.value,
+  breaks = c(-Inf, 0.001, 0.01, 0.05, Inf),
+  labels = c("***", "**", "*", "ns")
+)
+
+cor_com <- cor_com %>%
+  arrange(desc(r2))
+
+write.csv(cor_com,
+          "CCA_environmental_factors_significance_relative_abundance.csv",
+          row.names = FALSE)
+
+print(cor_com)
+
+# ============================================================
+# 14. 环境因子解释力条形图
+# ============================================================
+cor_com_plot <- cor_com
+cor_com_plot$Factor <- factor(cor_com_plot$Factor,
+                              levels = cor_com_plot$Factor[order(cor_com_plot$r2)])
+
+p_env <- ggplot(cor_com_plot,
+                aes(x = Factor, y = r2, fill = p.value < 0.05)) +
+  geom_bar(stat = "identity",
+           width = 0.7,
+           color = "black",
+           linewidth = 0.3) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("TRUE" = "#D5231D", "FALSE" = "gray80"),
+    labels = c("TRUE" = "p < 0.05", "FALSE" = "p \u2265 0.05"),
+    name = "Significance"
+  ) +
+  geom_text(aes(label = significance),
+            hjust = -0.2,
+            size = 5) +
+  labs(title = "Environmental drivers (envfit, relative abundance)",
+       x = "Environmental factors",
+       y = expression(Explanatory~power~(r^2))) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(color = "black", size = 10),
+        axis.title = element_text(face = "bold"),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.title = element_text(face = "bold")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+
+ggsave("CCA_envfit_barplot_relative_abundance.pdf",
+       p_env,
+       width = 7,
+       height = 5)
+
+ggsave("CCA_envfit_barplot_relative_abundance.png",
+       p_env,
+       width = 7,
+       height = 5,
+       dpi = 600)
+
+cat("\nAll CCA and envfit analyses finished successfully!\n")
+cat("Main output files:\n")
+cat("1. CCA_relative_abundance_black_points_outlier_removed_adjusted_size.pdf\n")
+cat("2. CCA_environmental_factors_significance_relative_abundance.csv\n")
+cat("3. CCA_envfit_barplot_relative_abundance.pdf\n")
+cat("4. CCA_envfit_barplot_relative_abundance.png\n")
+

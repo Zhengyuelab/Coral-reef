@@ -1,0 +1,167 @@
+# ========================
+# Alpha Diversity Analysis
+# ========================
+# 加载所需包
+library(microeco)
+library(magrittr)
+library(ggplot2)
+library(ggtree)
+library(ape)
+library(tidyverse)
+library(ggpubr)
+
+# 设置 ggplot2 主题
+theme_set(theme_bw())
+
+# 工作目录设置（根据实际情况取消注释）
+
+setwd("")
+
+# ---------- 1. 数据读取 ----------
+otu   <- read.csv(file = "asv_sampling.csv",   header = TRUE, check.names = FALSE, row.names = 1)
+sample <- read.csv(file = "sample_sampling.csv", header = TRUE, check.names = FALSE, row.names = 1)
+tax   <- read.csv(file = "tax_table.csv",      header = TRUE, check.names = FALSE, row.names = 1)
+tree  <- read.tree("filtered_tree.tree")
+
+# ---------- 2. 创建 microtable 对象 ----------
+dataset <- microtable$new(
+  sample_table = sample,
+  otu_table    = otu,
+  tax_table    = tax,
+  phylo_tree   = tree
+)
+dataset
+
+# ---------- 3. 抽平（按16S或18S选择对应深度） ----------
+# 16S 数据
+dataset$sample_sums() %>% range()
+dataset$rarefy_samples(sample.size = 1094)
+dataset$sample_sums() %>% range()
+
+# ---------- 4. 计算丰度 ----------
+dataset$cal_abund()
+class(dataset$taxa_abund)
+dir.create("taxa_abund")
+dataset$save_abund(dirpath = "taxa_abund")
+
+# ---------- 5. 计算 Alpha 多样性 ----------
+# PD = TRUE 时计算系统发育多样性（速度较慢）
+dataset$cal_alphadiv(PD = FALSE)
+alpha <- dataset$alpha_diversity
+class(dataset$alpha_diversity)
+
+dir.create("alpha_DJ_diversity")
+dataset$save_alphadiv(dirpath = "alpha_DJ_diversity")
+
+# 重新读入保存的结果
+alpha <- read.csv("alpha_DJ_diversity/alpha_diversity.csv", 
+                  header = TRUE, row.names = 1, check.names = FALSE)
+
+# ---------- 6. 可视化 ----------
+# (A) 柱状图：每个样本的 Alpha 多样性
+
+# 数据准备：添加样本名与分组信息
+alpha_data <- alpha %>%
+  rownames_to_column("Sample")
+
+sample_info <- sample %>%
+  rownames_to_column("Sample") %>%
+  select(Sample, Group = Group)   # 假设分组列名为 'Group'
+
+combined_data <- alpha_data %>%
+  left_join(sample_info, by = "Sample") %>%
+  mutate(Group = factor(Group, levels = c("Poor", "Moderate", "Good"))) %>%
+  arrange(Group, Sample) %>%
+  mutate(Sample = factor(Sample, levels = unique(Sample)))
+
+# 转换为长格式
+long_data <- combined_data %>%
+  pivot_longer(
+    cols      = -c(Sample, Group),
+    names_to  = "Alpha_Index",
+    values_to = "Value"
+  )
+
+# 绘制柱状图
+alpha_sample <- ggplot(long_data, aes(x = Sample, y = Value, fill = Group)) +
+  geom_col(width = 0.8) +
+  scale_fill_manual(
+    values = c("Poor" = "#ED8D5A", "Moderate" = "#EFCE87", "Good" = "#72B063"),
+    name   = "Group"
+  ) +
+  facet_wrap(~ Alpha_Index, scales = "free_y", ncol = 3) +
+  labs(
+    title = "Alpha Diversity Metrics by Sample",
+    x     = "Sample",
+    y     = "Diversity Value"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x          = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6),
+    strip.background     = element_rect(fill = "white"),
+    panel.grid.major.x   = element_blank(),
+    legend.position      = "top"
+  )
+
+alpha_sample
+ggsave("alpha_sample.pdf", alpha_sample, width = 15, height = 10, dpi = 300)
+
+# (B) 箱线图：组间比较（带显著性标注）
+
+# 计算每个指标的最大值，用于调整显著性标注位置
+max_values <- long_data %>%
+  group_by(Alpha_Index) %>%
+  summarise(max_val = max(Value, na.rm = TRUE)) %>%
+  ungroup()
+
+# 定义两两比较组合
+my_comparisons <- list(
+  c("Poor", "Moderate"),
+  c("Moderate", "Good"),
+  c("Poor", "Good")
+)
+
+alpha_group_clean <- ggplot(long_data, aes(x = Group, y = Value, fill = Group)) +
+  geom_boxplot(width = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.4, size = 1.5) +
+  stat_compare_means(
+    comparisons = my_comparisons,
+    method      = "t.test",
+    label       = "p.signif",
+    size        = 5,
+    step.increase = 0.12,
+    tip.length  = 0.01
+  ) +
+  stat_compare_means(
+    method      = "anova",
+    label.y.npc = 0.95,
+    label.x.npc = 0.5,
+    size        = 4
+  ) +
+  facet_wrap(~ Alpha_Index, scales = "free_y", ncol = 3) +
+  scale_fill_manual(
+    values = c("Poor" = "#ED8D5A", "Moderate" = "#EFCE87", "Good" = "#72B063"),
+    name   = "Group"
+  ) +
+  labs(
+    title = "Alpha Diversity Comparison by Group",
+    x     = NULL,
+    y     = "Alpha Diversity Value"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title          = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x         = element_text(angle = 0, hjust = 0.5, size = 12, face = "bold"),
+    axis.ticks.x        = element_blank(),
+    strip.background    = element_rect(fill = "grey92", color = "grey92"),
+    strip.text          = element_text(face = "bold"),
+    legend.position     = "none",
+    panel.grid.major    = element_blank(),
+    panel.grid.minor    = element_blank(),
+    panel.spacing       = unit(1, "lines")
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+
+alpha_group_clean
+ggsave("alpha_group_clean.pdf", plot = alpha_group_clean, width = 12, height = 9, device = cairo_pdf)
+

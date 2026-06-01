@@ -1,0 +1,152 @@
+# ============================================================
+# NearDJ vs OffDJ environmental factors boxplot with significance
+# ============================================================
+
+# ---------- 0. 加载核心包 ----------
+packages <- c("tidyverse", "ggpubr", "readr")
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# ---------- 1. 设置工作目录 ----------
+setwd("/code/Environmental difference/Off_Near/Data")
+
+# ---------- 2. 读取环境因子数据 ----------
+file_path <- "环境因子（近礁和远礁）.csv"
+env <- read.csv(file_path,
+                header = TRUE,
+                stringsAsFactors = FALSE,
+                fileEncoding = "UTF-8-BOM",
+                check.names = FALSE)
+
+# 设置分组顺序
+env$Group <- factor(env$Group, levels = c("NearDJ", "OffDJ"))
+
+# ---------- 3. 将环境因子列转换为数值型 ----------
+env <- env %>%
+  mutate(across(.cols = -c(SampleID, Group),
+                .fns = ~ parse_number(as.character(.))))
+
+# ---------- 4. 剔除异常值（如不需要可删除） ----------
+env_clean <- env %>%
+  mutate(NO3 = ifelse(SampleID == "Sample57", NA, NO3))
+
+# ---------- 5. 自动识别环境因子列 ----------
+env_vars <- env_clean %>%
+  select(-SampleID, -Group) %>%
+  select(where(is.numeric)) %>%
+  colnames()
+
+cat("Detected environmental variables:\n")
+print(env_vars)
+
+# ---------- 6. 单因子差异检验函数 ----------
+compare_env_factor <- function(var_name, data) {
+  df <- data %>%
+    select(Group, value = all_of(var_name)) %>%
+    filter(!is.na(Group), !is.na(value))
+  
+  if (length(unique(df$Group)) < 2) {
+    return(tibble(Variable = var_name,
+                  Test = NA_character_,
+                  P_value = NA_real_))
+  }
+  
+  normality <- df %>%
+    group_by(Group) %>%
+    summarise(
+      n = n(),
+      unique_n = length(unique(value)),
+      shapiro_p = ifelse(n >= 3 & unique_n >= 3,
+                         shapiro.test(value)$p.value,
+                         NA_real_),
+      .groups = "drop"
+    )
+  
+  use_ttest <- all(normality$shapiro_p > 0.05, na.rm = TRUE) &&
+    sum(!is.na(normality$shapiro_p)) == 2
+  
+  if (use_ttest) {
+    test_res <- t.test(value ~ Group, data = df, var.equal = FALSE)
+    test_name <- "Welch t-test"
+  } else {
+    test_res <- wilcox.test(value ~ Group, data = df, exact = FALSE)
+    test_name <- "Wilcoxon rank-sum test"
+  }
+  
+  tibble(Variable = var_name,
+         Test = test_name,
+         P_value = test_res$p.value)
+}
+
+# ---------- 7. 批量差异检验 + FDR 校正 ----------
+diff_result <- map_dfr(env_vars, compare_env_factor, data = env_clean) %>%
+  mutate(
+    FDR = p.adjust(P_value, method = "BH"),
+    Significance = case_when(
+      FDR < 0.001 ~ "***",
+      FDR < 0.01  ~ "**",
+      FDR < 0.05  ~ "*",
+      TRUE        ~ "ns"
+    )
+  )
+
+print(diff_result)
+
+# ---------- 8. 整理长表用于绘图 ----------
+env_long <- env_clean %>%
+  pivot_longer(cols = all_of(env_vars),
+               names_to = "Variable",
+               values_to = "Value") %>%
+  filter(!is.na(Value))
+
+# ---------- 9. 计算显著性标注位置 ----------
+label_position <- env_long %>%
+  group_by(Variable) %>%
+  summarise(
+    ymin = min(Value, na.rm = TRUE),
+    ymax = max(Value, na.rm = TRUE),
+    yrange = ymax - ymin,
+    y.position = ifelse(yrange == 0,
+                        ymax * 1.1 + 0.1,
+                        ymax + 0.15 * yrange),
+    .groups = "drop"
+  )
+
+stat_label <- diff_result %>%
+  select(Variable, P_value, FDR, Significance) %>%
+  left_join(label_position, by = "Variable") %>%
+  mutate(group1 = "NearDJ",
+         group2 = "OffDJ",
+         label = Significance)
+
+print(stat_label)
+
+# ---------- 10. 绘制箱式图 ----------
+p_box <- ggplot(env_long, aes(x = Group, y = Value, fill = Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6, width = 0.6) +
+  geom_jitter(width = 0.15, size = 1.8, alpha = 0.7) +
+  stat_pvalue_manual(stat_label,
+                     label = "label",
+                     xmin = "group1",
+                     xmax = "group2",
+                     y.position = "y.position",
+                     tip.length = 0.01,
+                     size = 4) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 5) +
+  theme_bw() +
+  theme(strip.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "none") +
+  labs(x = NULL, y = "Environmental factor value")
+
+print(p_box)
+
+# ---------- 11. 保存 PDF ----------
+ggsave("NearDJ_vs_OffDJ_environmental_factors_boxplot_with_significance.pdf",
+       plot = p_box, width = 12, height = 4)
+
+cat("\n分析完成！输出文件：NearDJ_vs_OffDJ_environmental_factors_boxplot_with_significance.pdf\n")

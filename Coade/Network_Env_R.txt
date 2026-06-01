@@ -1,0 +1,355 @@
+# ============================================================
+# Environment vs sample-level network nodes/edges correlation
+# Only output:
+# Environment_vs_nodes_edges_correlation_heatmap.pdf
+# ============================================================
+
+# -----------------------------
+# 1. Load packages
+# -----------------------------
+packages <- c("dplyr", "tidyr", "ggplot2", "igraph")
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# -----------------------------
+# 2. Set working directory
+# -----------------------------
+setwd("/code/Network_Env/Data")
+
+# -----------------------------
+# 3. File paths and parameters
+# -----------------------------
+env_file <- "022Env.csv"
+asv_file <- "asv_sampling.csv"
+output_pdf <- "Environment_vs_nodes_edges_correlation_heatmap.pdf"
+
+group_order <- c("Poor", "Moderate", "Good")
+exclude_cols <- c("SampleID", "Sample", "Group", "Distance", "long", "la")
+
+# ASV filtering
+min_total_abundance   <- 10
+min_prevalence_samples <- 2
+topN_taxa             <- 1600
+
+# Co-occurrence network thresholds
+network_method  <- "spearman"
+r_threshold     <- 0.8
+p_threshold     <- 0.05
+use_fdr_for_edges <- FALSE   # keep consistent with original network.i logic
+
+# -----------------------------
+# 4. Read environmental data
+# -----------------------------
+env <- read.csv(env_file,
+                header = TRUE,
+                check.names = FALSE,
+                fileEncoding = "UTF-8-BOM")
+
+colnames(env) <- trimws(colnames(env))
+
+# Identify sample ID column
+if ("SampleID" %in% colnames(env)) {
+  sample_col <- "SampleID"
+} else if ("Sample" %in% colnames(env)) {
+  sample_col <- "Sample"
+} else {
+  stop("环境因子表中需要有 SampleID 或 Sample 列。")
+}
+if (!"Group" %in% colnames(env)) stop("环境因子表中需要有 Group 列。")
+
+colnames(env)[colnames(env) == sample_col] <- "SampleID"
+env$SampleID <- trimws(as.character(env$SampleID))
+env$Group    <- trimws(as.character(env$Group))
+env$Group    <- factor(env$Group, levels = group_order)
+rownames(env) <- env$SampleID
+
+# Extract environmental variables (numeric only)
+env_vars <- setdiff(colnames(env), exclude_cols)
+cat("Environmental variables used:\n")
+print(env_vars)
+
+env_data <- as.data.frame(lapply(env[, env_vars, drop = FALSE],
+                                 function(x) as.numeric(as.character(x))))
+rownames(env_data) <- env$SampleID
+
+# Remove samples with NA in any environmental variable
+complete_samples <- complete.cases(env_data)
+env <- env[complete_samples, , drop = FALSE]
+env_data <- env_data[complete_samples, , drop = FALSE]
+
+# -----------------------------
+# 5. Read ASV table
+# -----------------------------
+asv_raw <- read.csv(asv_file,
+                    header = TRUE,
+                    row.names = 1,
+                    check.names = FALSE)
+
+asv_mat <- as.matrix(asv_raw)
+mode(asv_mat) <- "numeric"
+rownames(asv_mat) <- trimws(rownames(asv_mat))
+colnames(asv_mat) <- trimws(colnames(asv_mat))
+
+# Align samples
+common_samples <- intersect(colnames(asv_mat), env$SampleID)
+cat("Common samples between ASV and env tables:", length(common_samples), "\n")
+if (length(common_samples) < 6) stop("共同样品太少，请检查样品名。")
+
+asv_mat <- asv_mat[, common_samples, drop = FALSE]
+env <- env[common_samples, , drop = FALSE]
+env_data <- env_data[common_samples, , drop = FALSE]
+stopifnot(all(colnames(asv_mat) == env$SampleID))
+
+# ============================================================
+# 6. Helper functions
+# ============================================================
+
+# Relative abundance (columns sum to 1)
+to_relative_abundance <- function(mat_asv_sample) {
+  sample_sums <- colSums(mat_asv_sample)
+  sample_sums[sample_sums == 0] <- NA
+  rel <- sweep(mat_asv_sample, 2, sample_sums, "/")
+  rel[is.na(rel)] <- 0
+  return(rel)
+}
+
+# Filter ASVs by total abundance, prevalence, and top N
+filter_asv <- function(mat_asv_sample,
+                       min_total_abundance,
+                       min_prevalence_samples,
+                       topN_taxa) {
+  total_abund <- rowSums(mat_asv_sample)
+  prevalence <- rowSums(mat_asv_sample > 0)
+  keep <- total_abund > min_total_abundance & prevalence >= min_prevalence_samples
+  mat_f <- mat_asv_sample[keep, , drop = FALSE]
+  if (nrow(mat_f) == 0) stop("过滤后没有 ASV，请调整阈值。")
+  if (is.finite(topN_taxa) && nrow(mat_f) > topN_taxa) {
+    top_taxa <- names(sort(rowSums(mat_f), decreasing = TRUE))[1:topN_taxa]
+    mat_f <- mat_f[top_taxa, , drop = FALSE]
+  }
+  return(mat_f)
+}
+
+# Fast correlation and p-value matrix (samples × taxa)
+fast_cor_p <- function(mat_sample_taxa, method = "spearman") {
+  if (method == "spearman") {
+    mat_use <- apply(mat_sample_taxa, 2, rank, ties.method = "average")
+  } else {
+    mat_use <- mat_sample_taxa
+  }
+  r_mat <- cor(mat_use, use = "pairwise.complete.obs", method = "pearson")
+  n <- nrow(mat_sample_taxa)
+  # Avoid infinite t-values
+  r_mat[r_mat > 0.999999] <- 0.999999
+  r_mat[r_mat < -0.999999] <- -0.999999
+  t_mat <- r_mat * sqrt((n - 2) / (1 - r_mat^2))
+  p_mat <- 2 * pt(-abs(t_mat), df = n - 2)
+  diag(r_mat) <- 1
+  diag(p_mat) <- 0
+  return(list(r = r_mat, p = p_mat))
+}
+
+# Build edge table from correlation matrices
+make_edge_table <- function(r_mat, p_mat, group_name,
+                            r_threshold, p_threshold, use_fdr) {
+  taxa <- rownames(r_mat)
+  idx <- which(upper.tri(r_mat), arr.ind = TRUE)
+  edge <- data.frame(
+    source = taxa[idx[, 1]],
+    target = taxa[idx[, 2]],
+    r = r_mat[idx],
+    p = p_mat[idx],
+    stringsAsFactors = FALSE
+  ) %>% filter(!is.na(r), !is.na(p))
+  
+  edge$p_adj <- p.adjust(edge$p, method = "BH")
+  
+  if (use_fdr) {
+    edge <- edge %>% filter(abs(r) >= r_threshold, p_adj < p_threshold)
+  } else {
+    edge <- edge %>% filter(abs(r) >= r_threshold, p < p_threshold)
+  }
+  
+  edge <- edge %>% mutate(sign = ifelse(r > 0, "Positive", "Negative"),
+                          Group = group_name)
+  return(edge)
+}
+
+# Extract sample-level nodes and edges from a network
+calculate_sample_nodes_edges <- function(graph_g, mat_asv_sample, group_name) {
+  sample_ids <- colnames(mat_asv_sample)
+  if (vcount(graph_g) == 0) {
+    return(data.frame(SampleID = sample_ids,
+                      Group = group_name,
+                      Sample_nodes = 0,
+                      Sample_edges = 0))
+  }
+  graph_nodes <- V(graph_g)$name
+  out <- data.frame()
+  for (s in sample_ids) {
+    present_taxa <- rownames(mat_asv_sample)[mat_asv_sample[, s] > 0]
+    present_taxa <- intersect(present_taxa, graph_nodes)
+    if (length(present_taxa) < 2) {
+      tmp <- data.frame(SampleID = s, Group = group_name,
+                        Sample_nodes = length(present_taxa),
+                        Sample_edges = 0)
+    } else {
+      subg <- induced_subgraph(graph_g, vids = present_taxa)
+      tmp <- data.frame(SampleID = s, Group = group_name,
+                        Sample_nodes = vcount(subg),
+                        Sample_edges = ecount(subg))
+    }
+    out <- rbind(out, tmp)
+  }
+  return(out)
+}
+
+# ============================================================
+# 7. Build networks per group and extract sample nodes/edges
+# ============================================================
+sample_nodes_edges <- data.frame()
+
+for (gname in group_order) {
+  cat("\n--- Processing group:", gname, "---\n")
+  
+  samples_g <- intersect(env$SampleID[env$Group == gname], colnames(asv_mat))
+  if (length(samples_g) < 4) {
+    warning(paste("Group", gname, "样品数少于 4，跳过。"))
+    next
+  }
+  
+  asv_g <- asv_mat[, samples_g, drop = FALSE]
+  asv_g_f <- filter_asv(asv_g, min_total_abundance, min_prevalence_samples, topN_taxa)
+  asv_g_rel <- to_relative_abundance(asv_g_f)
+  
+  mat_sample_taxa <- t(asv_g_rel)      # samples × ASVs
+  # Remove zero-variance ASVs
+  sd_taxa <- apply(mat_sample_taxa, 2, sd)
+  mat_sample_taxa <- mat_sample_taxa[, sd_taxa > 0, drop = FALSE]
+  
+  if (ncol(mat_sample_taxa) < 2) {
+    warning(paste("Group", gname, "可用于相关分析的 ASV 少于 2，跳过。"))
+    next
+  }
+  
+  cor_res <- fast_cor_p(mat_sample_taxa, method = network_method)
+  edge_g <- make_edge_table(cor_res$r, cor_res$p, gname,
+                            r_threshold, p_threshold, use_fdr_for_edges)
+  cat("Number of edges:", nrow(edge_g), "\n")
+  
+  if (nrow(edge_g) > 0) {
+    graph_g <- graph_from_data_frame(d = edge_g, directed = FALSE,
+                                     vertices = data.frame(
+                                       name = unique(c(edge_g$source, edge_g$target))
+                                     ))
+    E(graph_g)$weight <- edge_g$r
+    E(graph_g)$sign   <- edge_g$sign
+  } else {
+    graph_g <- make_empty_graph(directed = FALSE)
+  }
+  
+  sample_tmp <- calculate_sample_nodes_edges(graph_g, asv_g_f, gname)
+  sample_nodes_edges <- rbind(sample_nodes_edges, sample_tmp)
+}
+
+if (nrow(sample_nodes_edges) == 0) {
+  stop("未能生成任何 sample-level nodes/edges 结果。")
+}
+
+# Merge with environmental data
+sample_nodes_edges_env <- sample_nodes_edges %>%
+  left_join(env %>% select(SampleID, Group, all_of(env_vars)),
+            by = c("SampleID", "Group"))
+
+# ============================================================
+# 8. Spearman correlation: env factors vs sample nodes/edges
+# ============================================================
+metrics <- c("Sample_nodes", "Sample_edges")
+cor_results <- data.frame()
+
+for (gname in group_order) {
+  df_g <- sample_nodes_edges_env %>% filter(Group == gname)
+  for (metric in metrics) {
+    for (ev in env_vars) {
+      if (length(unique(na.omit(df_g[[metric]]))) < 2 ||
+          length(unique(na.omit(df_g[[ev]]))) < 2) next
+      
+      test <- suppressWarnings(
+        cor.test(df_g[[ev]], df_g[[metric]], method = "spearman", exact = FALSE)
+      )
+      cor_results <- rbind(cor_results,
+                           data.frame(Group = gname,
+                                      Environmental_factor = ev,
+                                      Network_parameter = metric,
+                                      Spearman_rho = as.numeric(test$estimate),
+                                      P_value = test$p.value))
+    }
+  }
+}
+
+if (nrow(cor_results) == 0) stop("没有有效的相关性结果。")
+
+# BH adjustment within each Group × Network_parameter
+cor_results <- cor_results %>%
+  group_by(Group, Network_parameter) %>%
+  mutate(P_adj = p.adjust(P_value, method = "BH")) %>%
+  ungroup() %>%
+  arrange(Group, Network_parameter, P_adj)
+
+# ============================================================
+# 9. Visualize: correlation heatmap
+# ============================================================
+cor_plot <- cor_results %>%
+  mutate(
+    Group = factor(Group, levels = c("Poor", "Moderate", "Good")),
+    Network_parameter = factor(Network_parameter,
+                               levels = c("Sample_nodes", "Sample_edges"),
+                               labels = c("Sample nodes", "Sample edges")),
+    Environmental_factor = factor(Environmental_factor,
+                                  levels = c("Conductance", "DO", "N02", "NH4",
+                                             "NO3", "pH", "PO3", "Salinity",
+                                             "SiO3", "T"),
+                                  labels = c("Conductance", "DO", "NO2", "NH4",
+                                             "NO3", "pH", "PO4", "Salinity",
+                                             "SiO3", "Temperature")),
+    Sig_label = case_when(
+      P_adj < 0.001 ~ "***",
+      P_adj < 0.01  ~ "**",
+      P_adj < 0.05  ~ "*",
+      TRUE           ~ ""
+    )
+  ) %>%
+  filter(!is.na(Environmental_factor))
+
+p_heatmap <- ggplot(cor_plot,
+                    aes(x = Environmental_factor, y = Network_parameter, fill = Spearman_rho)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = Sig_label), size = 5.2, color = "black", fontface = "bold") +
+  facet_wrap(~ Group, nrow = 1) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, limits = c(-1, 1),
+                       breaks = c(-1, -0.5, 0, 0.5, 1),
+                       name = "Spearman\nrho") +
+  labs(x = "Environmental factor", y = "Network parameter") +
+  theme_bw(base_size = 14) +
+  theme(panel.grid = element_blank(),
+        panel.border = element_rect(color = "black", linewidth = 0.6),
+        strip.background = element_rect(fill = "grey90", color = "black", linewidth = 0.6),
+        strip.text = element_text(size = 14, face = "bold"),
+        axis.title = element_text(size = 15, face = "bold"),
+        axis.text.x = element_text(size = 11.5, color = "black", angle = 45, hjust = 1, vjust = 1),
+        axis.text.y = element_text(size = 12.5, color = "black"),
+        legend.title = element_text(size = 12, face = "bold"),
+        legend.text = element_text(size = 11),
+        legend.key.height = unit(0.55, "cm"),
+        legend.key.width = unit(0.35, "cm"),
+        plot.margin = margin(8, 8, 8, 8))
+
+ggsave(output_pdf, p_heatmap, width = 12.5, height = 4.2, units = "in", limitsize = FALSE)
+
+cat("\n分析完成！输出文件：", output_pdf, "\n")
+

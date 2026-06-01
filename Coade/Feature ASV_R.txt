@@ -1,0 +1,509 @@
+rm(list = ls())
+
+# ============================================================
+# ASV-score-based health state prediction validation
+# 修正版：解决 select() 等函数冲突问题
+# ============================================================
+
+# ---------- 0. 加载 R 包 ----------
+packages <- c("tidyverse", "readr", "ggplot2", "pheatmap")
+
+for (pkg in packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+  library(ggplot2)
+  library(pheatmap)
+})
+
+# ---------- 1. 设置路径 ----------
+setwd("/Users/ios/Desktop/厦门大学的副本/AEM/数据/02_主图及补充图数据及代码/code/Feature ASV verification /Data")
+
+asv_file      <- "24year_ASV.csv"
+metadata_file <- "样品健康状态.csv"
+out_dir       <- "ASV_health_prediction_validation_results"
+
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+# ---------- 2. 读取数据 ----------
+asv_df <- read.csv(
+  asv_file,
+  header = TRUE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  fileEncoding = "UTF-8-BOM"
+)
+
+cat("ASV数据维度：", nrow(asv_df), "个ASV；", ncol(asv_df), "列\n")
+
+metadata <- read.csv(
+  metadata_file,
+  header = TRUE,
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  fileEncoding = "UTF-8-BOM"
+)
+
+cat("样品分组数据维度：", nrow(metadata), "个样品；", ncol(metadata), "列\n")
+
+# 清理列名前后空格
+colnames(asv_df) <- trimws(colnames(asv_df))
+colnames(metadata) <- trimws(colnames(metadata))
+
+# ---------- 3. 检查必要列 ----------
+required_asv_cols  <- c("ASV_ID", "Final_biased_to")
+required_meta_cols <- c("SampleID", "Group")
+
+if (!all(required_asv_cols %in% colnames(asv_df))) {
+  stop(
+    "ASV文件缺少必要列：",
+    paste(setdiff(required_asv_cols, colnames(asv_df)), collapse = ", ")
+  )
+}
+
+if (!all(required_meta_cols %in% colnames(metadata))) {
+  stop("样品健康状态文件缺少必要列：SampleID 和 Group。")
+}
+
+# ---------- 4. 统一健康状态标签 ----------
+clean_health_state <- function(x) {
+  x <- trimws(as.character(x))
+  x <- dplyr::case_when(
+    x %in% c("Good", "good", "GOOD", "好") ~ "Good",
+    x %in% c("Moderate", "moderate", "MODERATE", "中") ~ "Moderate",
+    x %in% c("Poor", "poor", "POOR", "差") ~ "Poor",
+    TRUE ~ x
+  )
+  return(x)
+}
+
+valid_states <- c("Good", "Moderate", "Poor")
+
+asv_df <- asv_df %>%
+  dplyr::mutate(
+    Final_biased_to = clean_health_state(Final_biased_to)
+  ) %>%
+  dplyr::filter(Final_biased_to %in% valid_states)
+
+metadata <- metadata %>%
+  dplyr::mutate(
+    SampleID = trimws(as.character(SampleID)),
+    Group = clean_health_state(Group)
+  ) %>%
+  dplyr::filter(Group %in% valid_states)
+
+cat("\n特征ASV数量：", nrow(asv_df), "\n")
+
+cat("ASV偏向状态统计：\n")
+print(table(asv_df$Final_biased_to))
+
+cat("\n原始样品健康状态统计：\n")
+print(table(metadata$Group))
+
+# ---------- 5. 提取样品丰度列并匹配 ----------
+sample_cols <- setdiff(colnames(asv_df), required_asv_cols)
+common_samples <- intersect(sample_cols, metadata$SampleID)
+
+if (length(common_samples) == 0) {
+  stop("ASV丰度表中的样品名和原始健康状态表中的 SampleID 没有匹配项。")
+}
+
+cat("\nASV丰度表中的样品数：", length(sample_cols), "\n")
+cat("原始健康状态表中的样品数：", nrow(metadata), "\n")
+cat("成功匹配的样品数：", length(common_samples), "\n")
+
+missing_in_metadata <- setdiff(sample_cols, metadata$SampleID)
+missing_in_asv <- setdiff(metadata$SampleID, sample_cols)
+
+if (length(missing_in_metadata) > 0) {
+  cat("\n以下样品仅在ASV表存在：\n")
+  print(missing_in_metadata)
+}
+
+if (length(missing_in_asv) > 0) {
+  cat("\n以下样品仅在健康状态表存在：\n")
+  print(missing_in_asv)
+}
+
+# 关键修正：显式使用 dplyr::select 和 dplyr::all_of
+abund_df <- asv_df %>%
+  dplyr::select(
+    ASV_ID,
+    Final_biased_to,
+    dplyr::all_of(common_samples)
+  )
+
+# 转换为数值
+for (col in common_samples) {
+  abund_df[[col]] <- as.numeric(abund_df[[col]])
+}
+
+abund_df[is.na(abund_df)] <- 0
+
+# ---------- 6. 转换为相对丰度 ----------
+use_relative_abundance <- TRUE
+
+if (use_relative_abundance) {
+  
+  abund_matrix <- abund_df %>%
+    dplyr::select(dplyr::all_of(common_samples)) %>%
+    as.matrix()
+  
+  col_sums <- colSums(abund_matrix, na.rm = TRUE)
+  col_sums[col_sums == 0] <- 1
+  
+  abund_df[, common_samples] <- sweep(abund_matrix, 2, col_sums, "/")
+  
+  cat("\n已转换为样品内相对丰度。\n")
+  
+} else {
+  
+  cat("\n使用原始丰度进行计算。\n")
+}
+
+# ---------- 7. 计算每个样品的 Good/Moderate/Poor 得分 ----------
+long_df <- abund_df %>%
+  tidyr::pivot_longer(
+    cols = dplyr::all_of(common_samples),
+    names_to = "SampleID",
+    values_to = "Abundance"
+  )
+
+score_df <- long_df %>%
+  dplyr::group_by(SampleID, Final_biased_to) %>%
+  dplyr::summarise(
+    Score = sum(Abundance, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::complete(
+    SampleID,
+    Final_biased_to = valid_states,
+    fill = list(Score = 0)
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = Final_biased_to,
+    values_from = Score,
+    names_prefix = "Score_"
+  )
+
+# 如果某一状态完全没有 ASV，补齐对应列
+for (state in valid_states) {
+  score_col <- paste0("Score_", state)
+  if (!score_col %in% colnames(score_df)) {
+    score_df[[score_col]] <- 0
+  }
+}
+
+# ---------- 8. 计算相对概率 ----------
+score_df <- score_df %>%
+  dplyr::mutate(
+    Total_score = Score_Good + Score_Moderate + Score_Poor,
+    Prob_Good = ifelse(Total_score > 0, Score_Good / Total_score, NA),
+    Prob_Moderate = ifelse(Total_score > 0, Score_Moderate / Total_score, NA),
+    Prob_Poor = ifelse(Total_score > 0, Score_Poor / Total_score, NA)
+  )
+
+# ---------- 9. 预测健康状态 ----------
+score_df <- score_df %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    Predicted_health_status = {
+      scores <- c(
+        Good = Score_Good,
+        Moderate = Score_Moderate,
+        Poor = Score_Poor
+      )
+      if (sum(scores, na.rm = TRUE) == 0) {
+        "Unclassified"
+      } else {
+        names(scores)[which.max(scores)]
+      }
+    },
+    Max_probability = max(c(Prob_Good, Prob_Moderate, Prob_Poor), na.rm = TRUE),
+    Second_probability = {
+      probs <- sort(c(Prob_Good, Prob_Moderate, Prob_Poor), decreasing = TRUE)
+      ifelse(length(probs) >= 2, probs[2], NA)
+    },
+    Probability_margin = Max_probability - Second_probability,
+    Confidence = dplyr::case_when(
+      is.na(Max_probability) ~ "Unclassified",
+      Max_probability >= 0.70 & Probability_margin >= 0.30 ~ "High",
+      Max_probability >= 0.50 & Probability_margin >= 0.15 ~ "Moderate",
+      TRUE ~ "Low"
+    )
+  ) %>%
+  dplyr::ungroup()
+
+# ---------- 10. 合并原始健康状态，判断匹配 ----------
+validation_df <- score_df %>%
+  dplyr::left_join(
+    metadata %>%
+      dplyr::select(
+        SampleID,
+        Original_health_status = Group
+      ),
+    by = "SampleID"
+  ) %>%
+  dplyr::mutate(
+    Match = ifelse(
+      Predicted_health_status == Original_health_status,
+      "Matched",
+      "Not_matched"
+    )
+  ) %>%
+  dplyr::select(
+    SampleID,
+    Original_health_status,
+    Predicted_health_status,
+    Match,
+    Confidence,
+    dplyr::starts_with("Score_"),
+    dplyr::starts_with("Prob_"),
+    Max_probability,
+    Probability_margin
+  )
+
+# ---------- 11. 总体准确率 ----------
+overall_accuracy <- mean(validation_df$Match == "Matched", na.rm = TRUE)
+
+cat("\n总体匹配准确率：", round(overall_accuracy * 100, 2), "%\n")
+
+accuracy_summary <- data.frame(
+  Metric = "Overall_accuracy",
+  Value = overall_accuracy
+)
+
+# ---------- 12. 各健康状态准确率 ----------
+class_accuracy <- validation_df %>%
+  dplyr::group_by(Original_health_status) %>%
+  dplyr::summarise(
+    Total_samples = dplyr::n(),
+    Matched_samples = sum(Match == "Matched", na.rm = TRUE),
+    Accuracy = Matched_samples / Total_samples,
+    .groups = "drop"
+  )
+
+cat("\n各健康状态匹配准确率：\n")
+print(class_accuracy)
+
+# ---------- 13. 混淆矩阵 ----------
+confusion_matrix <- table(
+  Original = validation_df$Original_health_status,
+  Predicted = validation_df$Predicted_health_status
+)
+
+cat("\n混淆矩阵：\n")
+print(confusion_matrix)
+
+confusion_df <- as.data.frame(confusion_matrix)
+
+# ---------- 14. 输出表格 ----------
+write.csv(
+  validation_df,
+  file.path(out_dir, "Sample_prediction_vs_original_health_status.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+write.csv(
+  accuracy_summary,
+  file.path(out_dir, "Overall_accuracy_summary.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+write.csv(
+  class_accuracy,
+  file.path(out_dir, "Class_accuracy_summary.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+write.csv(
+  confusion_df,
+  file.path(out_dir, "Confusion_matrix.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# 不匹配样品
+mismatch_df <- validation_df %>%
+  dplyr::filter(Match == "Not_matched") %>%
+  dplyr::arrange(Original_health_status, Predicted_health_status)
+
+write.csv(
+  mismatch_df,
+  file.path(out_dir, "Mismatched_samples.csv"),
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+cat("不匹配样品数量：", nrow(mismatch_df), "\n")
+
+# ---------- 15. 绘图 ----------
+# 15.1 混淆矩阵热图
+confusion_plot_df <- confusion_df %>%
+  dplyr::rename(
+    Original_health_status = Original,
+    Predicted_health_status = Predicted,
+    Count = Freq
+  )
+
+p_confusion <- ggplot(
+  confusion_plot_df,
+  aes(
+    x = Predicted_health_status,
+    y = Original_health_status,
+    fill = Count
+  )
+) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = Count), size = 5) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    x = "Predicted health status",
+    y = "Original health status",
+    fill = "Sample count",
+    title = paste0(
+      "Confusion matrix of ASV-score prediction\n",
+      "Overall accuracy = ",
+      round(overall_accuracy * 100, 2),
+      "%"
+    )
+  )
+
+ggsave(
+  file.path(out_dir, "Confusion_matrix_heatmap.pdf"),
+  p_confusion,
+  width = 6,
+  height = 5
+)
+
+# 15.2 每个样品的预测概率图
+prob_plot_df <- validation_df %>%
+  dplyr::select(
+    SampleID,
+    Original_health_status,
+    Predicted_health_status,
+    Match,
+    Prob_Good,
+    Prob_Moderate,
+    Prob_Poor
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(Prob_Good, Prob_Moderate, Prob_Poor),
+    names_to = "Health_state",
+    values_to = "Probability"
+  ) %>%
+  dplyr::mutate(
+    Health_state = gsub("Prob_", "", Health_state),
+    SampleID = factor(SampleID, levels = validation_df$SampleID)
+  )
+
+p_prob <- ggplot(
+  prob_plot_df,
+  aes(
+    x = SampleID,
+    y = Probability,
+    fill = Health_state
+  )
+) +
+  geom_bar(
+    stat = "identity",
+    position = "stack",
+    width = 0.8
+  ) +
+  facet_grid(
+    ~ Original_health_status,
+    scales = "free_x",
+    space = "free_x"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(
+      angle = 90,
+      hjust = 1,
+      vjust = 0.5,
+      size = 7
+    ),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "Sample",
+    y = "Relative probability",
+    fill = "Predicted state signal",
+    title = "ASV-score-based health-state probabilities for each sample"
+  )
+
+ggsave(
+  file.path(out_dir, "Sample_prediction_probability_barplot.pdf"),
+  p_prob,
+  width = 12,
+  height = 6
+)
+
+# 15.3 匹配与不匹配样品数量图
+match_summary <- validation_df %>%
+  dplyr::count(Original_health_status, Match)
+
+p_match <- ggplot(
+  match_summary,
+  aes(
+    x = Original_health_status,
+    y = n,
+    fill = Match
+  )
+) +
+  geom_bar(
+    stat = "identity",
+    position = "stack",
+    width = 0.7
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "Original health status",
+    y = "Number of samples",
+    fill = "Prediction result",
+    title = "Matched and mismatched samples by original health status"
+  )
+
+ggsave(
+  file.path(out_dir, "Matched_vs_mismatched_samples.pdf"),
+  p_match,
+  width = 6,
+  height = 5
+)
+
+# ---------- 16. 终端总结 ----------
+cat("\n==================== 分析完成 ====================\n")
+cat("输出文件夹：", out_dir, "\n\n")
+cat("1. 样品预测结果与原始状态对比：Sample_prediction_vs_original_health_status.csv\n")
+cat("2. 总体准确率：Overall_accuracy_summary.csv\n")
+cat("3. 各健康状态准确率：Class_accuracy_summary.csv\n")
+cat("4. 混淆矩阵：Confusion_matrix.csv 和 Confusion_matrix_heatmap.pdf\n")
+cat("5. 不匹配样品：Mismatched_samples.csv\n")
+cat("6. 每个样品预测概率图：Sample_prediction_probability_barplot.pdf\n")
+cat("7. 匹配与不匹配样品数量图：Matched_vs_mismatched_samples.pdf\n")
+cat("总体匹配准确率：", round(overall_accuracy * 100, 2), "%\n")
+
+cat("\n各健康状态准确率：\n")
+print(class_accuracy)
+
+cat("\n混淆矩阵：\n")
+print(confusion_matrix)
+
